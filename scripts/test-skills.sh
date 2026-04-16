@@ -213,6 +213,7 @@ fi
 
 # /aif localization contract regression checks
 AIF_SKILL="$ROOT_DIR/skills/aif/SKILL.md"
+AIF_ARCH_SKILL="$ROOT_DIR/skills/aif-architecture/SKILL.md"
 MODE2_DESCRIPTION_SECTION="$(awk '
     /^\*\*Step 3: Create \.ai-factory\/DESCRIPTION\.md\*\*$/ { capture=1 }
     capture { print }
@@ -234,6 +235,21 @@ EXISTING_PROJECT_SUGGESTIONS_SECTION="$(awk '
     capture { print }
     /^Present these as `AskUserQuestion` with multi-select options:$/ { if (capture) exit }
 ' "$AIF_SKILL")"
+AIF_ARCH_DESCRIPTION_SECTION="$(awk '
+    /^### Step 3: Update DESCRIPTION\.md$/ { capture=1 }
+    capture { print }
+    /^### Step 4: Update AGENTS\.md$/ { if (capture) exit }
+' "$AIF_ARCH_SKILL")"
+AIF_ARCH_AGENTS_SECTION="$(awk '
+    /^### Step 4: Update AGENTS\.md$/ { capture=1 }
+    capture { print }
+    /^### Step 5: Confirm$/ { if (capture) exit }
+' "$AIF_ARCH_SKILL")"
+AIF_ARCH_CONFIRM_SECTION="$(awk '
+    /^### Step 5: Confirm$/ { capture=1 }
+    capture { print }
+    /^## Artifact Ownership$/ { if (capture) exit }
+' "$AIF_ARCH_SKILL")"
 
 if grep -Fq 'Immediately after determining Mode 1, Mode 2, or Mode 3, resolve the project language settings for the entire `/aif` run.' "$AIF_SKILL"; then
     pass "/aif resolves language immediately after mode detection"
@@ -291,10 +307,11 @@ fi
 
 MODE2_CONFIG_LINE=$(printf '%s\n' "$MODE2_DESCRIPTION_SECTION" | grep -nF 'Write `.ai-factory/config.yaml` from `skills/aif/references/config-template.yaml` before saving this file.' | cut -d: -f1 | head -n1)
 MODE2_SAVE_LINE=$(printf '%s\n' "$MODE2_DESCRIPTION_SECTION" | grep -nF 'Save to `.ai-factory/DESCRIPTION.md`.' | cut -d: -f1 | head -n1)
-if [[ -n "$MODE2_CONFIG_LINE" && -n "$MODE2_SAVE_LINE" && "$MODE2_CONFIG_LINE" -lt "$MODE2_SAVE_LINE" ]]; then
-    pass "/aif Mode 2 writes config before saving DESCRIPTION.md"
+MODE2_MKDIR_LINE=$(printf '%s\n' "$MODE2_DESCRIPTION_SECTION" | grep -nF 'mkdir -p .ai-factory' | cut -d: -f1 | head -n1)
+if [[ -n "$MODE2_MKDIR_LINE" && -n "$MODE2_CONFIG_LINE" && -n "$MODE2_SAVE_LINE" && "$MODE2_MKDIR_LINE" -lt "$MODE2_CONFIG_LINE" && "$MODE2_CONFIG_LINE" -lt "$MODE2_SAVE_LINE" ]]; then
+    pass "/aif Mode 2 creates directory before config and DESCRIPTION writes"
 else
-    fail "/aif Mode 2 DESCRIPTION/config ordering is wrong"
+    fail "/aif Mode 2 mkdir/config/DESCRIPTION ordering is wrong"
 fi
 
 if printf '%s\n' "$MODE2_DESCRIPTION_SECTION" | grep -Fq '# Project: [Project Name]' \
@@ -362,6 +379,56 @@ if printf '%s\n' "$EXISTING_PROJECT_SUGGESTIONS_SECTION" | grep -Fq 'Generate pr
     fail "English existing-project suggestions reintroduced in /aif"
 else
     pass "no English existing-project suggestions in /aif"
+fi
+
+if printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq 'resolved `language.artifacts`' \
+   && printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq 'Use the resolved architecture path from config, not the default path literal.' \
+   && printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq '## [Localized heading: Architecture]' \
+   && printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq '[Localized sentence in resolved artifacts language referencing the resolved architecture artifact path for detailed architecture guidelines.]'; then
+    pass "/aif-architecture keeps DESCRIPTION companion update path-aware and localized"
+else
+    fail "/aif-architecture DESCRIPTION companion update contract missing"
+fi
+
+if printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq '## Architecture' \
+   || printf '%s\n' "$AIF_ARCH_DESCRIPTION_SECTION" | grep -Fq 'Pattern: [chosen pattern name]'; then
+    fail "English DESCRIPTION companion update reintroduced in /aif-architecture"
+else
+    pass "no English DESCRIPTION companion update in /aif-architecture"
+fi
+
+if printf '%s\n' "$AIF_ARCH_AGENTS_SECTION" | grep -Fq 'resolved `language.artifacts`' \
+   && printf '%s\n' "$AIF_ARCH_AGENTS_SECTION" | grep -Fq '| [resolved-architecture-path] | [Localized architecture artifact description in resolved artifacts language] |' \
+   && printf '%s\n' "$AIF_ARCH_AGENTS_SECTION" | grep -Fq 'Only add if the resolved architecture path is not already present.'; then
+    pass "/aif-architecture keeps AGENTS companion update path-aware and localized"
+else
+    fail "/aif-architecture AGENTS companion update contract missing"
+fi
+
+if printf '%s\n' "$AIF_ARCH_AGENTS_SECTION" | grep -Fq '| .ai-factory/ARCHITECTURE.md | Architecture decisions and guidelines |'; then
+    fail "default-path English AGENTS row reintroduced in /aif-architecture"
+else
+    pass "no default-path English AGENTS row in /aif-architecture"
+fi
+
+if printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'resolved `language.ui`' \
+   && printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq '[Localized pattern label in `language.ui`]: [chosen pattern]' \
+   && printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq '[Localized file label in `language.ui`]: [resolved architecture path]' \
+   && printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq '[Localized success heading in `language.ui`]' \
+   && printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq '[Localized closing sentence in `language.ui` about workflow skills following these architecture guidelines.]'; then
+    pass "/aif-architecture confirmation uses resolved UI language and path"
+else
+    fail "/aif-architecture confirmation localization/path contract missing"
+fi
+
+if printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'Architecture document generated!' \
+   || printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'Pattern: [chosen pattern]' \
+   || printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'File: .ai-factory/ARCHITECTURE.md' \
+   || printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'Key rules:' \
+   || printf '%s\n' "$AIF_ARCH_CONFIRM_SECTION" | grep -Fq 'All workflow skills (/aif-plan, /aif-implement) will now follow these architecture guidelines.'; then
+    fail "English default-path confirmation text reintroduced in /aif-architecture"
+else
+    pass "no English default-path confirmation text in /aif-architecture"
 fi
 
 # No hardcoded agent-specific values (must use {{template_vars}})

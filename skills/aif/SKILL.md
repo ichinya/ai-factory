@@ -426,12 +426,12 @@ After user confirms choices, create specification in resolved `language.artifact
 - [Localized label: Security]: [relevant security considerations]
 ```
 
-Write `.ai-factory/config.yaml` from `skills/aif/references/config-template.yaml` before saving this file.
-Save to `.ai-factory/DESCRIPTION.md`.
-
 ```bash
 mkdir -p .ai-factory
 ```
+
+Write `.ai-factory/config.yaml` from `skills/aif/references/config-template.yaml` before saving this file.
+Save to `.ai-factory/DESCRIPTION.md`.
 
 **Step 4: Search & Install Skills**
 
@@ -477,7 +477,7 @@ After getting description, proceed with same stack selection as Mode 2:
 
 **Step 4: Create .ai-factory/DESCRIPTION.md**
 
-Same as Mode 2, in resolved `language.artifacts`.
+Same as Mode 2, in resolved `language.artifacts`, including creating `.ai-factory` before writing `config.yaml` or `DESCRIPTION.md`.
 
 **Step 5: Setup Context**
 
