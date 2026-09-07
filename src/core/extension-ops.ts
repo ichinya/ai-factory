@@ -27,7 +27,7 @@ import {
 import { applyExtensionInjections, applySingleExtensionInjections, stripAllExtensionInjections, stripInjectionsByExtensionName } from './injections.js';
 import { configureExtensionMcpServers, removeExtensionMcpServers, validateMcpTemplate, type McpServerConfig } from './mcp.js';
 import { copyDirectory, ensureDir, fileExists, readJsonFile, removeDirectory } from '../utils/fs.js';
-import { resolveSkillTargets } from './skill-targets.js';
+import { logSkillTarget, resolveSkillTargets } from './skill-targets.js';
 import { captureSharedSkillRollback, collectSkillOwners, prepareSkillTargets, withSkillProjectLock } from './skills-migration.js';
 
 export interface ExtensionAssetInstallResult {
@@ -84,12 +84,19 @@ export async function installSkillsForAllAgents(
   }
 }
 
-export async function composeInstalledExtensionSkills(projectDir: string, config: AiFactoryConfig): Promise<number> {
+export async function composeInstalledExtensionSkills(
+  projectDir: string, config: AiFactoryConfig, options: { installReplacements?: boolean } = {},
+): Promise<number> {
   const installed = await loadAllExtensions(projectDir, (config.extensions ?? []).map(extension => extension.name));
   await collectSkillOwners(installed);
   for (const { dir, manifest } of installed) {
     const replaced = new Set(config.extensions?.find(extension => extension.name === manifest.name)?.replacedSkills ?? []);
-    const paths = [...Object.entries(manifest.replaces ?? {}).filter(([, name]) => replaced.has(name)).map(([relative]) => relative),
+    const replacementPaths = options.installReplacements === false ? []
+      : Object.entries(manifest.replaces ?? {}).filter(([, name]) => replaced.has(name)).map(([relative]) => relative);
+    if (options.installReplacements === false && replaced.size) {
+      logSkillTarget('[FIX:155] compose:retain-installed-replacements', { extension: manifest.name, skills: [...replaced] });
+    }
+    const paths = [...replacementPaths,
       ...(manifest.skills ?? []).filter(relative => !manifest.replaces?.[relative])];
     if (!paths.length) continue;
     const results = await installExtensionSkillsForAllAgents(projectDir, config.agents, dir, paths, manifest.replaces);

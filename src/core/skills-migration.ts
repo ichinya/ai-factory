@@ -79,11 +79,11 @@ function equalFiles(left: Map<string, Buffer>, right: Map<string, Buffer>): bool
   return left.size === right.size && [...left].every(([name, bytes]) => equalBytes(bytes, right.get(name) ?? null));
 }
 
-function managedHash(files: Map<string, Buffer>): string {
+function managedHash(files: Map<string, Buffer>, raw = false): string {
   const hash = createHash('sha256');
   for (const [name, bytes] of [...files].sort(([a], [b]) => a.localeCompare(b))) {
     hash.update(`path:${name}\n`);
-    hash.update(name.endsWith('.md') ? bytes.toString('utf8').replace(/\r\n/g, '\n')
+    hash.update(!raw && name.endsWith('.md') ? bytes.toString('utf8').replace(/\r\n/g, '\n')
       .replace(/\n?<!-- aif-ext:[^:]+:[^:]+:[^:]+:start -->\n[\s\S]*?\n<!-- aif-ext:[^:]+:[^:]+:[^:]+:end -->\n?/g, '').trimEnd() : bytes);
     hash.update('\n');
   }
@@ -257,7 +257,8 @@ export async function preflightSkillMigration(
         agent.managedSkills ??= {};
         if (owner.extension) delete agent.managedSkills[name]; // A replacement must not retain the old bundled-skill receipt.
         if (sourceState && agent.installedSkills.includes(name)) {
-          const state: ManagedSkillState = { sourceHash: sourceState.sourceHash, installedHash: managedHash(finalFiles), renderContextHash: group.context.hash };
+          const state: ManagedSkillState = { sourceHash: sourceState.sourceHash, installedHash: managedHash(finalFiles),
+            rawInstalledHash: managedHash(finalFiles, true), renderContextHash: group.context.hash };
           agent.managedSkills[name] = state;
         }
       }
@@ -418,8 +419,9 @@ async function finishJournal(projectDir: string, root: string, journal: Migratio
     if (current !== file.before && current !== file.after) throw new Error(`Concurrent file change during recovery: ${file.path}. Recovery material retained at ${root}.`);
   }
   for (const [index, file] of journal.files.entries()) {
-    const target = await physicalProjectPath(projectDir, file.path);
-    if (target !== file.physical) throw new Error(`Recovery target changed: ${file.path}`);
+    const target = await physicalProjectPath(projectDir, file.path, { preserveCase: true });
+    const identity = process.platform === 'win32' ? target.toLowerCase() : target;
+    if (identity !== file.physical) throw new Error(`Recovery target changed: ${file.path}`);
     const current = bytesDigest(await readOptional(target));
     if (current !== file.before && current !== file.after) throw new Error(`Concurrent file change: ${file.path}`);
     const desired = committed ? file.after : file.before;
@@ -503,8 +505,11 @@ export async function applySkillMigration(
       await writeJournal();
       for (const [index, file] of plan.files.entries()) {
         if (!file.after) continue; // Sources survive until the config commit is durable.
-        const physical = await physicalProjectPath(projectDir, file.path);
-        if (physical !== journal.files[index].physical || !equalBytes(await readOptional(physical), file.before)) throw new Error(`Concurrent destination change: ${file.path}`);
+        const physical = await physicalProjectPath(projectDir, file.path, { preserveCase: true });
+        const identity = process.platform === 'win32' ? physical.toLowerCase() : physical;
+        if (identity !== journal.files[index].physical || !equalBytes(await readOptional(physical), file.before)) throw new Error(`Concurrent destination change: ${file.path}`);
+        // The physical identity is case-folded on Windows. Preserve the proven
+        // source spelling when creating files so managed hashes stay identical.
         await atomicWrite(physical, file.after);
       }
       await options.onPhase?.('destination');

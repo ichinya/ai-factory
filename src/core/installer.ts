@@ -179,7 +179,7 @@ async function readManagedFileForHash(filePath: string): Promise<Buffer | null> 
   return readFileBuffer(filePath);
 }
 
-async function hashManagedFiles(files: Array<{ absPath: string; relPath: string }>): Promise<string | null> {
+async function hashManagedFiles(files: Array<{ absPath: string; relPath: string }>, raw = false): Promise<string | null> {
   if (files.length === 0) {
     return null;
   }
@@ -188,7 +188,7 @@ async function hashManagedFiles(files: Array<{ absPath: string; relPath: string 
   const hasher = createHash('sha256');
 
   for (const file of sortedFiles) {
-    const content = await readManagedFileForHash(file.absPath);
+    const content = await (raw ? readFileBuffer(file.absPath) : readManagedFileForHash(file.absPath));
     if (!content) {
       return null;
     }
@@ -200,7 +200,7 @@ async function hashManagedFiles(files: Array<{ absPath: string; relPath: string 
   return hasher.digest('hex');
 }
 
-async function hashManagedDirectory(dirPath: string): Promise<string | null> {
+async function hashManagedDirectory(dirPath: string, raw = false): Promise<string | null> {
   const files = await listFilesRecursive(dirPath);
   if (files.length === 0) {
     return null;
@@ -211,7 +211,7 @@ async function hashManagedDirectory(dirPath: string): Promise<string | null> {
     relPath: path.relative(dirPath, absPath).replaceAll('\\', '/'),
   }));
 
-  return hashManagedFiles(mapped);
+  return hashManagedFiles(mapped, raw);
 }
 
 async function hashManagedFile(filePath: string, relPath: string): Promise<string | null> {
@@ -380,9 +380,9 @@ export function resolveManagedSubagentPaths(
   return resolveAgentFilePaths(projectDir, agentsDir, sourceRoot, relPath);
 }
 
-async function hashInstalledSkill(paths: ResolvedSkillPaths): Promise<string | null> {
+async function hashInstalledSkill(paths: ResolvedSkillPaths, raw = false): Promise<string | null> {
   if (!paths.flat) {
-    return hashManagedDirectory(paths.targetSkillDir);
+    return hashManagedDirectory(paths.targetSkillDir, raw);
   }
 
   const mainFileExists = await fileExists(paths.targetSkillFile);
@@ -407,7 +407,7 @@ async function hashInstalledSkill(paths: ResolvedSkillPaths): Promise<string | n
     });
   }
 
-  return hashManagedFiles(filesToHash);
+  return hashManagedFiles(filesToHash, raw);
 }
 
 async function getManagedSkillState(
@@ -426,13 +426,15 @@ async function getManagedSkillState(
 
   const paths = resolveSkillPaths(projectDir, agentInstallation.skillsDir, agentInstallation.id, skillName, sourceSkillDir);
   const installedHash = await hashInstalledSkill(paths);
-  if (!installedHash) {
+  const rawInstalledHash = await hashInstalledSkill(paths, true);
+  if (!installedHash || !rawInstalledHash) {
     return null;
   }
 
   return {
     sourceHash,
     installedHash,
+    rawInstalledHash,
     renderContextHash: context.hash,
   };
 }
@@ -971,10 +973,14 @@ export async function removeOwnedSkills(
     }
     const saved = agent.managedSkills?.[name];
     const current = await getManagedSkillState(projectDir, agent, name);
-    if (!saved || !current || saved.installedHash !== current.installedHash) {
-      console.warn(`[skill-targets] Preserving unproven or modified skill: ${agent.skillsDir}/${name}`);
+    // Update hashes normalize injections and line endings; only a saved raw
+    // receipt can authorize deletion without losing those local changes.
+    if (!saved || !current || saved.installedHash !== current.installedHash
+      || !saved.rawInstalledHash || saved.rawInstalledHash !== current.rawInstalledHash) {
+      console.warn(`[skill-targets] [FIX:155] Preserving unproven or modified skill: ${agent.skillsDir}/${name}`);
       continue;
     }
+    logSkillTarget('[FIX:155] remove:verified-raw-baseline', { runtime: agent.id, skill: name });
     const transformer = getTransformer(agent.id).transform(name, '');
     if (transformer.flat) {
       await removeFile(path.join(projectDir, getAgentConfig(agent.id).configDir, transformer.targetDir, transformer.targetName));

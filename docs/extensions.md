@@ -495,7 +495,7 @@ The replacement skill is installed **under the base skill name**. For example, `
 
 #### Shared Skill Targets
 
-When Codex CLI and Codex app share a physical skill directory, base skills, replacements, custom skills, and injections are composed once per target. Results still count both runtimes, and each append/prepend injection marker occurs once. Re-init, update, and upgrade restore the registered extension composition after base installation.
+When Codex CLI and Codex app share a physical skill directory, each installation phase groups work by target. Results still count both runtimes, and each append/prepend injection marker occurs once. During update, a replacement installed by a successful extension refresh is retained; otherwise it is installed in the replacement phase, with base-skill fallback on failure. Final composition restores custom skills and injections without reinstalling replacements. Re-init and upgrade also restore the registered extension composition after base installation.
 
 Extensions must have unambiguous skill ownership. Two different custom sources with the same basename conflict, even within one extension. A custom skill cannot claim a bundled name unless the manifest explicitly declares `replaces`. These conflicts and incompatible shared renderers are checked before installed skill changes.
 

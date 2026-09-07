@@ -6,7 +6,7 @@ import { assertCompatibleSkillTargets, getTransformerIdentity, type SkillTargetR
 import { buildTemplateVars } from './template.js';
 
 export interface SkillRenderContext {
-  readonly agent: Readonly<AgentConfig>;
+  readonly agent: Readonly<AgentConfig & { homeSkillsDir?: string }>;
   readonly hash: string;
 }
 
@@ -47,7 +47,9 @@ function contains(parent: string, child: string): boolean {
 }
 
 // Resolve missing destinations using the nearest existing ancestor, including junctions.
-export async function physicalProjectPath(projectDir: string, relativePath: string): Promise<string> {
+export async function physicalProjectPath(
+  projectDir: string, relativePath: string, options: { preserveCase?: boolean } = {},
+): Promise<string> {
   const root = await fs.realpath(projectDir);
   const relative = normalizeRelative(relativePath);
   let candidate = path.resolve(root, relative);
@@ -56,7 +58,7 @@ export async function physicalProjectPath(projectDir: string, relativePath: stri
     try {
       const resolved = path.join(await fs.realpath(candidate), ...missing.reverse());
       if (!contains(root, resolved) || resolved === root) throw new Error(`Unsafe path outside project: ${relativePath}`);
-      return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+      return process.platform === 'win32' && !options.preserveCase ? resolved.toLowerCase() : resolved;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       // A dangling link must not be treated as a missing ordinary directory.
@@ -76,8 +78,10 @@ export function createSkillRenderContext(agentId: string, skillsDir: string, sha
   const agent = Object.freeze({
     ...registry,
     skillsDir: normalizeRelative(skillsDir),
-    ...(sharedCodex ? { configDir: '.codex', settingsFile: '.codex/config.toml', displayName: 'Codex', skillsCliAgent: 'codex' } : {}),
+    ...(sharedCodex ? { configDir: '.codex', settingsFile: '.codex/config.toml', displayName: 'Codex', skillsCliAgent: 'codex',
+      homeSkillsDir: getAgentConfig('codex').skillsDir } : {}),
   });
+  if (sharedCodex) logSkillTarget('[FIX:155] render:shared-home', { skillsDir: agent.skillsDir, homeSkillsDir: buildTemplateVars(agent).home_skills_dir });
   const hash = createHash('sha256').update(JSON.stringify({
     version: 1,
     transformer: getTransformerIdentity(agentId),

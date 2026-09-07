@@ -22,6 +22,7 @@ export interface ManagedArtifactState {
 
 export interface ManagedSkillState extends ManagedArtifactState {
   renderContextHash?: string;
+  rawInstalledHash?: string;
 }
 
 export interface AgentFileSource {
@@ -155,8 +156,10 @@ function normalizeManagedArtifacts(raw: unknown): Record<string, ManagedArtifact
 function normalizeManagedSkills(raw: unknown): Record<string, ManagedSkillState> {
   const result: Record<string, ManagedSkillState> = normalizeManagedArtifacts(raw);
   for (const [name, state] of Object.entries(result)) {
-    const hash = (raw as Record<string, { renderContextHash?: unknown }>)[name]?.renderContextHash;
-    if (typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) state.renderContextHash = hash;
+    for (const field of ['renderContextHash', 'rawInstalledHash'] as const) {
+      const hash = (raw as Record<string, Record<string, unknown>>)[name]?.[field];
+      if (typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) state[field] = hash;
+    }
   }
   return result;
 }

@@ -20,7 +20,7 @@ import {
   updateSkills,
   updateSubagents,
 } from '../../core/installer.js';
-import {resolveSkillTargets} from '../../core/skill-targets.js';
+import {logSkillTarget, resolveSkillTargets} from '../../core/skill-targets.js';
 import {prepareSkillTargets, withSkillProjectLock} from '../../core/skills-migration.js';
 import {
   installExtensionSkillsForAllAgents,
@@ -239,6 +239,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
   if (selfUpdated) return;
 
   const extensions = config.extensions ?? [];
+  const refreshedExtensions = new Set<string>();
 
   if (force) {
     console.log(chalk.yellow('⚠ Force mode enabled: clean reinstall of installed base skills\n'));
@@ -260,6 +261,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
 
     if (extensionSummary.updated.length > 0) {
       for (const r of extensionSummary.updated) {
+        refreshedExtensions.add(r.name);
         console.log(chalk.green(`  ✓ ${r.name}: v${r.oldVersion} → v${r.newVersion}`));
       }
     }
@@ -351,6 +353,10 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
     // Fix 3: If manifest fails to load, fall back to installing the base skill
     const failedReplacements: string[] = [];
     for (const ext of extensions) {
+      if (refreshedExtensions.has(ext.name)) {
+        logSkillTarget('[FIX:155] update:retain-refreshed-replacements', { extension: ext.name });
+        continue;
+      }
       if (!ext.replacedSkills?.length) continue;
       const extensionDir = path.join(getExtensionsDir(projectDir), ext.name);
       const manifest = extensionManifests.get(ext.name);
@@ -446,7 +452,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
 
     // Re-apply extension injections
     if (config.extensions?.length) {
-      const totalInjections = await composeInstalledExtensionSkills(projectDir, config);
+      const totalInjections = await composeInstalledExtensionSkills(projectDir, config, { installReplacements: false });
       if (totalInjections > 0) {
         console.log(chalk.green(`✓ Re-applied ${totalInjections} extension injection(s)`));
       }
@@ -457,8 +463,17 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
     for (const agent of config.agents) {
       const { base: baseSkills } = partitionSkills(agent.installedSkills);
       const managedBaseSkills = baseSkills.filter(skill => availableSkills.includes(skill) && !finalReplacedSkills.has(skill));
-      agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
+      const managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
         groups.find(group => group.targets.some(target => target.id === agent.id))!.context);
+      const rewritten = new Set((skillEntriesByAgent.get(agent.id) ?? []).filter(entry => entry.status === 'changed').map(entry => entry.skill));
+      // An unchanged normalized hash cannot prove ownership of current raw bytes.
+      // Keep the previous evidence, including its absence, for untouched skills.
+      for (const [skill, state] of Object.entries(managedSkills)) {
+        if (rewritten.has(skill)) continue;
+        state.rawInstalledHash = agent.managedSkills?.[skill]?.rawInstalledHash;
+        logSkillTarget('[FIX:155] update:retain-raw-baseline', { runtime: agent.id, skill, proven: !!state.rawInstalledHash });
+      }
+      agent.managedSkills = managedSkills;
       if ((agent.configFiles ?? []).length > 0) {
         agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, agent.installedConfigFiles ?? []);
       } else {
