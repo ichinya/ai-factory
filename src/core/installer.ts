@@ -18,9 +18,10 @@ import {
   fileExists,
   hashDirectory,
 } from '../utils/fs.js';
-import type { AgentFileSource, AgentInstallation, ManagedArtifactState, ManagedSkillState } from './config.js';
+import type { AgentFileSource, AgentInstallation, ExtensionRecord, ManagedArtifactState, ManagedSkillState } from './config.js';
 import { getAgentConfig } from './agents.js';
-import { getExtensionsDir, type ExtensionManifest, type ExtensionAgentFile } from './extensions.js';
+import { getExtensionsDir, loadAllExtensions, type ExtensionManifest, type ExtensionAgentFile } from './extensions.js';
+import { applyInjection } from './injections.js';
 import { processSkillTemplates, buildTemplateVars, processTemplate } from './template.js';
 import { createSkillRenderContext, logSkillTarget, physicalProjectPath, type SkillRenderContext } from './skill-targets.js';
 import { getTransformer, extractFrontmatterName, replaceFrontmatterName } from './transformer.js';
@@ -439,17 +440,144 @@ async function getManagedSkillState(
   };
 }
 
+interface ReceiptInjection {
+  target: string;
+  position: 'append' | 'prepend';
+  extensionName: string;
+  content: string;
+}
+
+async function readReceiptSourceFile(projectDir: string, file: string): Promise<Buffer> {
+  const relative = path.relative(path.resolve(projectDir), path.resolve(file));
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Receipt source escapes project: ${file}`);
+  }
+  let current = path.resolve(projectDir);
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new Error(`Linked receipt source: ${current}`);
+  }
+  if (!(await fs.lstat(current)).isFile()) throw new Error(`Receipt source is not a file: ${current}`);
+  return fs.readFile(current);
+}
+
+async function loadReceiptInjections(
+  projectDir: string, registeredExtensions: readonly ExtensionRecord[],
+): Promise<ReceiptInjection[]> {
+  const names = registeredExtensions.map(extension => extension.name);
+  const installed = await loadAllExtensions(projectDir, names);
+  if (new Set(names).size !== names.length || installed.length !== names.length) {
+    throw new Error('Missing or ambiguous registered extension manifest');
+  }
+  const injections: ReceiptInjection[] = [];
+  for (const { dir, manifest } of installed) {
+    await readReceiptSourceFile(projectDir, path.join(dir, 'extension.json'));
+    const record = registeredExtensions.find(extension => extension.name === manifest.name);
+    if (!record || record.version !== manifest.version) throw new Error(`Unproven extension revision: ${manifest.name}`);
+    for (const injection of manifest.injections ?? []) {
+      injections.push({ ...injection, extensionName: manifest.name,
+        content: (await readReceiptSourceFile(projectDir, path.join(dir, injection.file))).toString('utf8') });
+    }
+  }
+  return injections;
+}
+
+async function inventoryReceiptFiles(directory: string): Promise<Map<string, Buffer>> {
+  const files = new Map<string, Buffer>();
+  async function visit(current: string, relative: string): Promise<void> {
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new Error(`Linked installed skill entry: ${current}`);
+    if (stat.isDirectory()) {
+      for (const name of await fs.readdir(current)) {
+        await visit(path.join(current, name), relative ? `${relative}/${name}` : name);
+      }
+    } else if (stat.isFile() && relative) {
+      files.set(relative, await fs.readFile(current));
+    } else {
+      throw new Error(`Unsupported installed skill entry: ${current}`);
+    }
+  }
+  await visit(directory, '');
+  return files;
+}
+
+async function proveManagedSkillRawHash(
+  projectDir: string, agent: AgentInstallation, skillName: string, context: SkillRenderContext,
+  injections: readonly ReceiptInjection[],
+): Promise<string> {
+  const sourceSkillDir = path.join(getSkillsDir(), skillName);
+  if ((await fs.lstat(sourceSkillDir)).isSymbolicLink()) throw new Error(`Linked bundled skill source: ${skillName}`);
+  const expected = await renderSkillFiles(sourceSkillDir, skillName, agent.id, context);
+  let content = expected.get('SKILL.md')!.toString('utf8');
+  for (const injection of injections) {
+    if (injection.target === skillName) {
+      content = applyInjection(content, injection.content, injection.position, injection.extensionName, skillName);
+    }
+  }
+  expected.set('SKILL.md', Buffer.from(content));
+  const paths = resolveSkillPaths(projectDir, agent.skillsDir, agent.id, skillName, sourceSkillDir);
+  let actual: Map<string, Buffer>;
+  if (paths.flat) {
+    // Flat workflows share their references directory. Prove the files belonging
+    // to this source only; removal leaves all references and other workflows in place.
+    const mainName = path.basename(paths.targetSkillFile);
+    expected.set(mainName, expected.get('SKILL.md')!);
+    expected.delete('SKILL.md');
+    for (const relative of expected.keys()) {
+      if (relative !== mainName && !relative.startsWith('references/')) expected.delete(relative);
+    }
+    actual = new Map();
+    for (const relative of expected.keys()) {
+      const target = relative === mainName ? paths.targetSkillFile
+        : path.join(paths.targetRefsDir, relative.slice('references/'.length));
+      actual.set(relative, await readReceiptSourceFile(projectDir, target));
+    }
+  } else {
+    actual = await inventoryReceiptFiles(paths.targetSkillDir);
+  }
+  if (actual.size !== expected.size || [...expected].some(([relative, bytes]) => !actual.get(relative)?.equals(bytes))) {
+    throw new Error('Installed files differ from the complete known source and injection composition');
+  }
+  const hash = createHash('sha256');
+  for (const [relative, bytes] of [...actual].sort(([left], [right]) => left.localeCompare(right))) {
+    hash.update(`path:${relative}\n`);
+    hash.update(bytes);
+    hash.update('\n');
+  }
+  return hash.digest('hex');
+}
+
 export async function buildManagedSkillsState(
   projectDir: string,
   agentInstallation: AgentInstallation,
   baseSkills: string[],
   context?: SkillRenderContext,
+  registeredExtensions: readonly ExtensionRecord[] = [],
 ): Promise<Record<string, ManagedSkillState>> {
   const state: Record<string, ManagedSkillState> = {};
+  const renderContext = context ?? createSkillRenderContext(agentInstallation.id, agentInstallation.skillsDir);
+  let injections: ReceiptInjection[] | null = null;
+  try {
+    injections = await loadReceiptInjections(projectDir, registeredExtensions);
+  } catch (error) {
+    logSkillTarget('[FIX:155] receipt:unproven-extensions', { runtime: agentInstallation.id, reason: (error as Error).message });
+  }
 
   for (const skillName of baseSkills) {
-    const managed = await getManagedSkillState(projectDir, agentInstallation, skillName, context);
+    const managed = await getManagedSkillState(projectDir, agentInstallation, skillName, renderContext);
     if (managed) {
+      // Observed bytes support update decisions, but do not prove ownership.
+      // Overlay installs can leave user files even after a successful write.
+      delete managed.rawInstalledHash;
+      if (injections) {
+        try {
+          managed.rawInstalledHash = await proveManagedSkillRawHash(projectDir, agentInstallation, skillName, renderContext, injections);
+          logSkillTarget('[FIX:155] receipt:proven-source', { runtime: agentInstallation.id, skill: skillName });
+        } catch (error) {
+          logSkillTarget('[FIX:155] receipt:unproven-files', { runtime: agentInstallation.id, skill: skillName, reason: (error as Error).message });
+        }
+      }
       state[skillName] = managed;
     }
   }

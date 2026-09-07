@@ -280,7 +280,7 @@ async function upgradeLocked(): Promise<void> {
   for (const agent of config.agents) {
     agent.managedSkills = await buildManagedSkillsState(projectDir, agent,
       agent.installedSkills.filter(skill => availableSkills.includes(skill) && !replaced.has(skill)),
-      groups.find(group => group.targets.some(target => target.id === agent.id))!.context);
+      groups.find(group => group.targets.some(target => target.id === agent.id))!.context, config.extensions ?? []);
   }
 
   // Step 3: Update config to latest version and multi-agent schema

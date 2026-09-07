@@ -319,7 +319,7 @@ async function initLocked(options: InitOptions): Promise<void> {
     for (const agent of installedAgents) {
       const managedBaseSkills = agent.installedSkills.filter(skill => !replacedSkills.has(skill));
       agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
-        groups.find(group => group.targets.some(target => target.id === agent.id))!.context);
+        groups.find(group => group.targets.some(target => target.id === agent.id))!.context, existingExtensions);
       if ((agent.configFiles ?? []).length > 0) {
         agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, agent.installedConfigFiles ?? []);
       }

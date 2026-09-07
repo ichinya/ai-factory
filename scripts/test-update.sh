@@ -958,3 +958,4 @@ node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv[
 echo "bounded helper extension update smoke tests passed"
 
 node "$ROOT_DIR/scripts/test-codex-skill-targets.mjs" --group=migration,upgrade
+node "$ROOT_DIR/scripts/test-skill-migration-modes.mjs"

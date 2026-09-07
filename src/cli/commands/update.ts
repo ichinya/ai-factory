@@ -240,6 +240,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
 
   const extensions = config.extensions ?? [];
   const refreshedExtensions = new Set<string>();
+  const refreshedCustomSkills = new Map<string, Map<string, string[]>>();
 
   if (force) {
     console.log(chalk.yellow('⚠ Force mode enabled: clean reinstall of installed base skills\n'));
@@ -262,6 +263,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
     if (extensionSummary.updated.length > 0) {
       for (const r of extensionSummary.updated) {
         refreshedExtensions.add(r.name);
+        if (r.customSkillInstalls) refreshedCustomSkills.set(r.name, r.customSkillInstalls);
         console.log(chalk.green(`  ✓ ${r.name}: v${r.oldVersion} → v${r.newVersion}`));
       }
     }
@@ -452,7 +454,9 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
 
     // Re-apply extension injections
     if (config.extensions?.length) {
-      const totalInjections = await composeInstalledExtensionSkills(projectDir, config, { installReplacements: false });
+      const totalInjections = await composeInstalledExtensionSkills(projectDir, config, {
+        installReplacements: false, customSkillInstalls: refreshedCustomSkills,
+      });
       if (totalInjections > 0) {
         console.log(chalk.green(`✓ Re-applied ${totalInjections} extension injection(s)`));
       }
@@ -464,15 +468,7 @@ async function updateLocked(options: UpdateCommandOptions): Promise<void> {
       const { base: baseSkills } = partitionSkills(agent.installedSkills);
       const managedBaseSkills = baseSkills.filter(skill => availableSkills.includes(skill) && !finalReplacedSkills.has(skill));
       const managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
-        groups.find(group => group.targets.some(target => target.id === agent.id))!.context);
-      const rewritten = new Set((skillEntriesByAgent.get(agent.id) ?? []).filter(entry => entry.status === 'changed').map(entry => entry.skill));
-      // An unchanged normalized hash cannot prove ownership of current raw bytes.
-      // Keep the previous evidence, including its absence, for untouched skills.
-      for (const [skill, state] of Object.entries(managedSkills)) {
-        if (rewritten.has(skill)) continue;
-        state.rawInstalledHash = agent.managedSkills?.[skill]?.rawInstalledHash;
-        logSkillTarget('[FIX:155] update:retain-raw-baseline', { runtime: agent.id, skill, proven: !!state.rawInstalledHash });
-      }
+        groups.find(group => group.targets.some(target => target.id === agent.id))!.context, config.extensions ?? []);
       agent.managedSkills = managedSkills;
       if ((agent.configFiles ?? []).length > 0) {
         agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, agent.installedConfigFiles ?? []);

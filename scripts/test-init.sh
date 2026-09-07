@@ -1103,3 +1103,4 @@ EOF
 echo "windows npm resolution smoke tests passed"
 
 node "$ROOT_DIR/scripts/test-codex-skill-targets.mjs" --group=control,targets,core,preflight,ownership,cli
+node "$ROOT_DIR/scripts/test-managed-skill-receipts.mjs"

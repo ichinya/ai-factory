@@ -335,7 +335,9 @@ for (const change of ['edit-injection', 'remove-injection', 'line-endings']) {
     const base = await fs.readFile(skill, 'utf8');
     const installed = applyInjection(base, 'original injection', 'append', manifest.name, 'aif');
     await fs.writeFile(skill, installed);
-    agent.managedSkills = await buildManagedSkillsState(project, agent, ['aif']);
+    agent.managedSkills = await buildManagedSkillsState(project, agent, ['aif'], undefined,
+      [{ name: manifest.name, version: manifest.version, source: extensionDir }]);
+    assert.match(agent.managedSkills.aif.rawInstalledHash, /^[a-f0-9]{64}$/);
     await saveConfig(project, { version: '2.19.0', agents: [agent], extensions: [{ name: manifest.name, version: manifest.version, source: extensionDir }] }, { hydrateAgentFileSources: false });
     const changed = change === 'edit-injection' ? installed.replace('original injection', 'local user edit')
       : change === 'remove-injection' ? base : installed.replace(/\r?\n/g, '\r\n');
@@ -374,7 +376,7 @@ for (const legacy of [false, true]) {
     const before = await snapshot(path.join(project, '.agents/skills'));
     runUpdate(project);
     const saved = await loadConfig(project);
-    assert.equal(saved.agents[0].managedSkills.aif.rawInstalledHash, agent.managedSkills.aif.rawInstalledHash);
+    assert.equal(saved.agents[0].managedSkills.aif.rawInstalledHash, undefined);
     runInit(project, 'claude');
     assert.deepEqual(await snapshot(path.join(project, '.agents/skills')), before);
   });
@@ -395,6 +397,7 @@ for (const scenario of ['unchanged', 'force', 'partial-failure']) {
     await fs.writeFile(path.join(source, 'replacement/SKILL.md'), '---\nname: replacement\n---\nReplacement');
     await fs.writeFile(path.join(source, 'replacement/helper.txt'), 'v1');
     await fs.writeFile(path.join(source, 'demo/SKILL.md'), '---\nname: demo\n---\nCustom');
+    await fs.writeFile(path.join(source, 'demo/helper.txt'), 'custom helper');
     await fs.writeFile(path.join(source, 'append.md'), 'Append once');
     await fs.writeFile(path.join(source, 'prepend.md'), 'Prepend once');
     const manifest = { name: 'aif-ext-write-once', version: '1.0.0', skills: ['replacement', 'demo'], replaces: { replacement: 'aif' }, injections: [
@@ -410,20 +413,22 @@ for (const scenario of ['unchanged', 'force', 'partial-failure']) {
     }
     const commandUrl = pathToFileURL(path.join(root, 'dist/cli/commands/update.js')).href;
     const code = `import fs from 'node:fs/promises';
-      const original = fs.writeFile; let writes = 0, failed = false;
+      const original = fs.writeFile; let writes = 0, customWrites = 0, failed = false;
       fs.writeFile = async function(file, ...args) {
         const target = String(file).replaceAll('\\\\', '/');
         if (target.endsWith('/.agents/skills/aif/helper.txt')) writes++;
+        if (target.endsWith('/.agents/skills/demo/helper.txt')) customWrites++;
         if (${scenario === 'partial-failure'} && !failed && target.endsWith('/.claude/skills/aif/helper.txt')) { failed = true; throw new Error('injected replacement failure'); }
         return original.call(this, file, ...args);
       };
       globalThis.fetch = async () => ({ok:true,status:200,headers:{get:()=>null},json:async()=>({version:'2.19.0'})});
       const m = await import(${JSON.stringify(commandUrl)}); await m.updateCommand({force:${scenario === 'force'}});
-      console.log('WRITE_PROBE=' + JSON.stringify({writes,failed}));`;
+      console.log('WRITE_PROBE=' + JSON.stringify({writes,customWrites,failed}));`;
     const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: project, encoding: 'utf8', timeout: 60000 });
     assert.equal(result.status, 0, result.stderr + result.stdout);
     const observed = JSON.parse(result.stdout.match(/WRITE_PROBE=(\{[^\n]+\})/)[1]);
     assert.equal(observed.writes, 1, 'replacement rendered more than once');
+    assert.equal(observed.customWrites, 1, 'custom skill rendered more than once');
     assert.equal(observed.failed, scenario === 'partial-failure');
     const saved = await loadConfig(project);
     assert.deepEqual(saved.extensions[0].replacedSkills ?? [], scenario === 'partial-failure' ? [] : ['aif']);
@@ -498,6 +503,94 @@ test('extensions', 'shared replacements project outcomes and apply one injection
   await assert.rejects(fs.access(path.join(project, '.agents/skills/demo/SKILL.md')));
   assert.ok(!(await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8')).includes('Replacement'));
 });
+
+for (const scenario of ['shared', 'singleton', 'mixed', 'mixed-absent']) {
+  test('extensions', `failed replacement restores prior state without reverting successful siblings: ${scenario}`, async project => {
+    const mixed = scenario.startsWith('mixed');
+    const agents = scenario !== 'singleton' ? [installation('codex', '.agents/skills'), installation('codex-app', '.agents/skills')]
+      : [installation('claude', '.claude/skills')];
+    if (mixed) agents.push(installation('claude', '.claude/skills'));
+    const groups = await resolveSkillTargets(project, agents, { select: false });
+    const snapshots = new Map();
+    for (const group of groups) {
+      const absent = scenario === 'mixed-absent';
+      await installSkills({ projectDir: project, agentId: group.targets[0].id, skillsDir: group.skillsDir, skills: absent ? ['aif'] : ['aif', 'aif-fix'], renderContext: group.context });
+      const directory = path.join(project, group.skillsDir, 'aif-fix');
+      if (!absent) {
+        await fs.writeFile(path.join(directory, 'user-note.txt'), 'private local note');
+        await fs.mkdir(path.join(directory, 'empty'));
+        const main = path.join(directory, 'SKILL.md');
+        await fs.writeFile(main, applyInjection(await fs.readFile(main, 'utf8'), 'local injected bytes', 'append', 'aif-ext-prior', 'aif-fix'));
+      }
+      snapshots.set(directory, absent ? null : await snapshot(directory));
+    }
+    const target = path.join(project, mixed ? '.claude/skills' : groups[0].skillsDir, 'aif-fix');
+    const source = path.join(project, 'extension-source');
+    for (const name of ['good', 'broken']) {
+      await fs.mkdir(path.join(source, name), { recursive: true });
+      await fs.writeFile(path.join(source, name, 'SKILL.md'), `---\nname: ${name}\n---\nReplacement ${name}`);
+    }
+    await fs.writeFile(path.join(source, 'broken/helper.txt'), 'fails after SKILL write');
+    const manifest = { name: 'aif-ext-partial-write', version: '1.0.0', skills: ['good', 'broken'], replaces: { good: 'aif', broken: 'aif-fix' } };
+    const writeFile = fs.writeFile;
+    let failed = false;
+    let result;
+    fs.writeFile = async function(file, ...args) {
+      if (!failed && path.resolve(String(file)) === path.join(target, 'helper.txt')) {
+        failed = true;
+        throw new Error('injected mid-copy failure');
+      }
+      return writeFile.call(this, file, ...args);
+    };
+    try { result = await installExtensionAssetsForAllAgents(project, agents, source, manifest); }
+    finally { fs.writeFile = writeFile; }
+    assert.equal(failed, true);
+    assert.deepEqual(result.replacedSkills, ['aif']);
+    assert.equal(result.replacementOutcomes[1].status, mixed ? 'rolled-back' : 'preserved-base');
+    assert.equal(result.replacementOutcomes[1].successCount, mixed ? 2 : 0);
+    assert.equal(result.replacementOutcomes[1].agentCount, agents.length);
+    for (const [directory, before] of snapshots) {
+      if (before === null) await assert.rejects(fs.access(directory));
+      else assert.deepEqual(await snapshot(directory), before, 'failed replacement left partial writes');
+      assert.ok((await fs.readFile(path.join(directory, '../aif/SKILL.md'), 'utf8')).includes('Replacement good'));
+    }
+  });
+}
+
+for (const failure of ['once', 'always']) {
+  test('extensions', `force update retries only failed custom skill targets: ${failure}`, async project => {
+    const agents = [installation('codex', '.agents/skills'), installation('codex-app', '.agents/skills'), installation('claude', '.claude/skills')];
+    const config = { version: '2.19.0', agents, extensions: [] };
+    const source = path.join(project, 'extension-source');
+    await fs.mkdir(path.join(source, 'demo'), { recursive: true });
+    await fs.writeFile(path.join(source, 'demo/SKILL.md'), '---\nname: demo\n---\nCustom');
+    await fs.writeFile(path.join(source, 'demo/helper.txt'), 'custom helper');
+    const manifest = { name: 'aif-ext-custom-retry', version: '1.0.0', skills: ['demo'] };
+    await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(manifest));
+    await commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest, cleanup: async () => {} } });
+    await saveConfig(project, config, { hydrateAgentFileSources: false });
+    const commandUrl = pathToFileURL(path.join(root, 'dist/cli/commands/update.js')).href;
+    const code = `import fs from 'node:fs/promises';
+      const original = fs.writeFile; let sharedWrites = 0, claudeWrites = 0;
+      process.on('exit', () => console.log('CUSTOM_PROBE=' + JSON.stringify({sharedWrites,claudeWrites})));
+      fs.writeFile = async function(file, ...args) {
+        const target = String(file).replaceAll('\\\\', '/');
+        if (target.endsWith('/.agents/skills/demo/helper.txt')) sharedWrites++;
+        if (target.endsWith('/.claude/skills/demo/helper.txt')) {
+          claudeWrites++;
+          if (${failure === 'always'} || claudeWrites === 1) throw new Error('injected custom failure');
+        }
+        return original.call(this, file, ...args);
+      };
+      globalThis.fetch = async () => ({ok:true,status:200,headers:{get:()=>null},json:async()=>({version:'2.19.0'})});
+      const m = await import(${JSON.stringify(commandUrl)}); await m.updateCommand({force:true});`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: project, encoding: 'utf8', timeout: 60000 });
+    assert.equal(result.status, failure === 'once' ? 0 : 1, result.stderr + result.stdout);
+    const observed = JSON.parse(result.stdout.match(/CUSTOM_PROBE=(\{[^\n]+\})/)[1]);
+    assert.deepEqual(observed, { sharedWrites: 1, claudeWrites: 2 });
+    if (failure === 'once') assert.equal(await fs.readFile(path.join(project, '.claude/skills/demo/helper.txt'), 'utf8'), 'custom helper');
+  });
+}
 
 test('migration', 'migration preserves native bytes and metadata and is repeatable', async project => {
   const config = await legacyProject(project);

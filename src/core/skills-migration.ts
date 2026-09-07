@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AgentInstallation, AiFactoryConfig, ManagedSkillState } from './config.js';
 import { loadConfig } from './config.js';
 import { getAgentConfig } from './agents.js';
+import { getTransformer } from './transformer.js';
 import { loadAllExtensions, type InstalledExtensionManifest } from './extensions.js';
 import { getAvailableSkills, buildManagedSkillsState, renderSkillFiles } from './installer.js';
 import { getSkillsDir } from '../utils/fs.js';
@@ -21,6 +22,7 @@ interface SkillOwner {
 
 interface TreeInventory {
   files: Map<string, Buffer>;
+  modes: Map<string, number>;
   directories: string[];
 }
 
@@ -28,11 +30,14 @@ interface MigrationFile {
   path: string;
   before: Buffer | null;
   after: Buffer | null;
+  beforeMode: number | null;
+  afterMode: number | null;
 }
 
 export interface SkillMigrationPlan {
   config: AiFactoryConfig;
   configBefore: Buffer | null;
+  configBeforeMode: number | null;
   groups: readonly SkillTargetGroup[];
   files: MigrationFile[];
   cleanupDirectories: string[];
@@ -50,6 +55,21 @@ function equalBytes(left: Buffer | null, right: Buffer | null): boolean {
   return left === null ? right === null : right !== null && left.equals(right);
 }
 
+async function readMode(file: string): Promise<number | null> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Unsafe managed file: ${file}`);
+    return stat.mode & 0o7777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function matchesFile(file: string, bytes: Buffer | null, mode: number | null): Promise<boolean> {
+  return equalBytes(await readOptional(file), bytes) && await readMode(file) === mode;
+}
+
 async function inventory(directory: string): Promise<TreeInventory | null> {
   try {
     const stat = await fs.lstat(directory);
@@ -58,7 +78,7 @@ async function inventory(directory: string): Promise<TreeInventory | null> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
-  const result: TreeInventory = { files: new Map(), directories: [''] };
+  const result: TreeInventory = { files: new Map(), modes: new Map(), directories: [''] };
   async function visit(current: string, prefix: string): Promise<void> {
     for (const entry of await fs.readdir(current, { withFileTypes: true })) {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -67,7 +87,10 @@ async function inventory(directory: string): Promise<TreeInventory | null> {
       if (entry.isDirectory()) {
         result.directories.push(relative);
         await visit(file, relative);
-      } else if (entry.isFile()) result.files.set(relative, await fs.readFile(file));
+      } else if (entry.isFile()) {
+        result.files.set(relative, await fs.readFile(file));
+        result.modes.set(relative, (await readMode(file))!);
+      }
       else throw new Error(`Unsupported managed skill entry: ${file}`);
     }
   }
@@ -144,6 +167,7 @@ export async function preflightSkillMigration(
   groups?: readonly SkillTargetGroup[],
 ): Promise<SkillMigrationPlan> {
   const configBefore = await readOptional(path.join(projectDir, '.ai-factory.json'));
+  const configBeforeMode = await readMode(path.join(projectDir, '.ai-factory.json'));
   const resolved = groups ?? await resolveSkillTargets(projectDir, config.agents);
   const previousGroups = await resolveSkillTargets(projectDir, config.agents, { select: false });
   const extensions = await loadAllExtensions(projectDir, (config.extensions ?? []).map(extension => extension.name));
@@ -160,12 +184,15 @@ export async function preflightSkillMigration(
   const files = new Map<string, MigrationFile>();
   const cleanupDirectories = new Set<string>();
   const warnings: string[] = [];
-  function addFile(relative: string, before: Buffer | null, after: Buffer | null): void {
+  function addFile(relative: string, before: Buffer | null, after: Buffer | null, beforeMode: number | null, afterMode: number | null): void {
     const previous = files.get(relative);
-    if (previous && (!equalBytes(previous.before, before) || !equalBytes(previous.after, after))) {
+    if (previous && (!equalBytes(previous.before, before) || !equalBytes(previous.after, after)
+      || previous.beforeMode !== beforeMode || previous.afterMode !== afterMode)) {
       throw new Error(`Conflicting migration writes: ${relative}`);
     }
-    if (!equalBytes(before, after)) files.set(relative, { path: relative, before, after });
+    // Unchanged destinations still prove that deleting the source is safe.
+    // Keep their bytes and modes in every precommit and recovery check.
+    files.set(relative, { path: relative, before, after, beforeMode, afterMode });
   }
   for (const group of resolved) {
     const participants = group.targets.map(target => config.agents.find(agent => agent.id === target.id)).filter((agent): agent is AgentInstallation => !!agent);
@@ -234,13 +261,19 @@ export async function preflightSkillMigration(
         && !proofs.some(proof => equalFiles(destinationTree.files, proof.files))) {
         throw new Error(`Skill migration conflict: "${destination}" and "${proofs[0].directory}" differ. No files were changed.`);
       }
-      for (const [relative, bytes] of finalFiles) addFile(`${destination}/${relative}`, destinationTree?.files.get(relative) ?? null, bytes);
+      for (const [relative, bytes] of finalFiles) {
+        const modes = new Set([...proofs.map(proof => proof.tree), ...(destinationTree ? [destinationTree] : [])]
+          .map(tree => tree.modes.get(relative)).filter((mode): mode is number => mode !== undefined));
+        if (modes.size !== 1) throw new Error(`Skill migration mode conflict: "${name}/${relative}" has differing or unknown permissions. Preserve copies and resolve their modes.`);
+        const afterMode = [...modes][0];
+        addFile(`${destination}/${relative}`, destinationTree?.files.get(relative) ?? null, bytes, destinationTree?.modes.get(relative) ?? null, afterMode);
+      }
       for (const [relative, bytes] of destinationTree?.files ?? []) {
-        if (!finalFiles.has(relative)) addFile(`${destination}/${relative}`, bytes, null);
+        if (!finalFiles.has(relative)) addFile(`${destination}/${relative}`, bytes, null, destinationTree!.modes.get(relative)!, null);
       }
       for (const proof of proofs) {
         if (proof.physical === destinationPath) continue;
-        for (const [relative, bytes] of proof.tree.files) addFile(`${proof.directory}/${relative}`, bytes, null);
+        for (const [relative, bytes] of proof.tree.files) addFile(`${proof.directory}/${relative}`, bytes, null, proof.tree.modes.get(relative)!, null);
         // Only directories required by known files are eligible for empty-directory cleanup.
         const knownDirectories = new Set(['']);
         for (const relative of proof.files.keys()) {
@@ -267,8 +300,9 @@ export async function preflightSkillMigration(
       if (participants.some(participant => participant.id === agent.id)) agent.skillsDir = group.skillsDir;
     }
   }
-  if (!equalBytes(await readOptional(path.join(projectDir, '.ai-factory.json')), configBefore)) throw new Error('Config revision changed during migration preflight. Retry after resolving concurrent edits.');
-  return { config: next, configBefore, groups: resolved,
+  if (!await matchesFile(path.join(projectDir, '.ai-factory.json'), configBefore, configBeforeMode)) throw new Error('Config revision or permissions changed during migration preflight. Retry after resolving concurrent edits.');
+  logSkillTarget('[FIX:155] preflight:preserved-modes', { files: files.size, configMode: configBeforeMode });
+  return { config: next, configBefore, configBeforeMode, groups: resolved,
     files: [...files.values()], cleanupDirectories: [...cleanupDirectories], warnings };
 }
 
@@ -281,24 +315,32 @@ interface JournalFile {
   physical: string;
   before: string | null;
   after: string | null;
+  beforeMode?: number | null;
+  afterMode?: number | null;
 }
 
 interface MigrationJournal {
-  version: 1;
+  version: 1 | 2;
   id: string;
   phase: 'prepared' | 'writing' | 'committed';
   configBefore: string | null;
   configAfter: string;
+  configBeforeMode?: number | null;
+  configAfterMode?: number;
   files: JournalFile[];
   cleanupDirectories: string[];
 }
 
-async function atomicWrite(file: string, bytes: Buffer): Promise<void> {
+async function atomicWrite(file: string, bytes: Buffer, mode: number = 0o600): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
-    const handle = await fs.open(temporary, 'wx');
-    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(bytes);
+      await handle.chmod(mode);
+      await handle.sync();
+    } finally { await handle.close(); }
     await fs.rename(temporary, file);
   } finally {
     await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
@@ -307,7 +349,7 @@ async function atomicWrite(file: string, bytes: Buffer): Promise<void> {
 
 async function checkedRuntimeRoot(projectDir: string): Promise<string> {
   const root = await physicalProjectPath(projectDir, MIGRATION_ROOT);
-  await fs.mkdir(root, { recursive: true });
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
   if ((await fs.lstat(root)).isSymbolicLink()) throw new Error('Migration state directory must not be a link.');
   return root;
 }
@@ -322,7 +364,7 @@ export async function withSkillProjectLock<T>(projectDir: string, action: () => 
   const lockBytes = Buffer.from(JSON.stringify({ pid: process.pid, token }));
   for (let attempt = 0; ; attempt++) {
     try {
-      await fs.writeFile(lockPath, lockBytes, { flag: 'wx' });
+      await fs.writeFile(lockPath, lockBytes, { flag: 'wx', mode: 0o600 });
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt > 0) throw error;
@@ -362,7 +404,7 @@ async function verifyJournal(
   projectDir: string, root: string, raw: unknown,
 ): Promise<{ journal: MigrationJournal; directory: string; before: Buffer | null; after: Buffer }> {
   const journal = raw as MigrationJournal;
-  if (!journal || journal.version !== 1 || !/^[a-f0-9-]{36}$/.test(journal.id)
+  if (!journal || ![1, 2].includes(journal.version) || !/^[a-f0-9-]{36}$/.test(journal.id)
     || !['prepared', 'writing', 'committed'].includes(journal.phase)
     || !Array.isArray(journal.files) || !Array.isArray(journal.cleanupDirectories)) throw new Error('Invalid skill migration journal. Preserve recovery material.');
   const directory = path.join(root, journal.id);
@@ -370,6 +412,10 @@ async function verifyJournal(
   const before = await readJournalBlob(directory, 'config.before', journal.configBefore);
   const after = await readJournalBlob(directory, 'config.after', journal.configAfter);
   if (!after) throw new Error('Missing committed config snapshot.');
+  const validMode = (mode: unknown, digest: string | null): boolean => digest === null ? mode === null
+    : typeof mode === 'number' && Number.isInteger(mode) && mode >= 0 && mode <= 0o7777;
+  if (journal.version === 2 && (!validMode(journal.configBeforeMode, journal.configBefore)
+    || !validMode(journal.configAfterMode, journal.configAfter))) throw new Error('Invalid config permissions in recovery journal.');
   const snapshots: Array<AiFactoryConfig & { agent?: string; skillsDir?: string }> = [JSON.parse(after.toString('utf8'))];
   if (before) snapshots.push(JSON.parse(before.toString('utf8')));
   const allowedRoots = new Set<string>();
@@ -384,6 +430,9 @@ async function verifyJournal(
   const allowedCleanup = new Set<string>();
   for (const [index, file] of journal.files.entries()) {
     if (!file || typeof file.path !== 'string' || typeof file.physical !== 'string') throw new Error('Invalid recovery file entry.');
+    if (journal.version === 2 && (!validMode(file.beforeMode, file.before) || !validMode(file.afterMode, file.after))) {
+      throw new Error(`Invalid recovery permissions: ${file.path}`);
+    }
     const actual = await physicalProjectPath(projectDir, file.path);
     if (actual !== file.physical || seen.has(actual) || ![...allowedRoots].some(allowed => actual.startsWith(`${allowed}${path.sep}`))) {
       throw new Error(`Recovery path changed or escaped its skill root: ${file.path}`);
@@ -407,30 +456,46 @@ async function verifyJournal(
   return { journal, directory, before, after };
 }
 
+async function matchesJournalConfig(file: string, journal: MigrationJournal, bytes: Buffer | null, committed: boolean): Promise<boolean> {
+  return equalBytes(await readOptional(file), bytes) && (journal.version === 1
+    || await readMode(file) === (committed ? journal.configAfterMode : journal.configBeforeMode));
+}
+
+async function recoveryFileState(target: string, file: JournalFile, journal: MigrationJournal, committed: boolean): Promise<boolean> {
+  const current = bytesDigest(await readOptional(target));
+  const desired = committed ? file.after : file.before;
+  if (journal.version === 1) {
+    if (current === desired) return true;
+    throw new Error(`Legacy migration journal lacks file permissions for ${file.path}. Preserve recovery material and reconcile this file manually.`);
+  }
+  const mode = await readMode(target);
+  if (!(current === file.before && mode === file.beforeMode) && !(current === file.after && mode === file.afterMode)) {
+    throw new Error(`Concurrent file change or permissions change during recovery: ${file.path}. Recovery material retained.`);
+  }
+  return current === desired && mode === (committed ? file.afterMode : file.beforeMode);
+}
+
 async function finishJournal(projectDir: string, root: string, journal: MigrationJournal, committed: boolean): Promise<void> {
   const { directory, before, after } = await verifyJournal(projectDir, root, journal);
   const configPath = path.join(projectDir, '.ai-factory.json');
-  if (!equalBytes(await readOptional(configPath), committed ? after : before)) {
+  if (!await matchesJournalConfig(configPath, journal, committed ? after : before, committed)) {
     throw new Error(`Config revision changed during migration recovery. Preserve ${root}; restore the expected config revision or reconcile it manually.`);
   }
   // Validate every affected file before any recovery mutation.
   for (const file of journal.files) {
-    const current = bytesDigest(await readOptional(await physicalProjectPath(projectDir, file.path)));
-    if (current !== file.before && current !== file.after) throw new Error(`Concurrent file change during recovery: ${file.path}. Recovery material retained at ${root}.`);
+    await recoveryFileState(await physicalProjectPath(projectDir, file.path), file, journal, committed);
   }
   for (const [index, file] of journal.files.entries()) {
     const target = await physicalProjectPath(projectDir, file.path, { preserveCase: true });
     const identity = process.platform === 'win32' ? target.toLowerCase() : target;
     if (identity !== file.physical) throw new Error(`Recovery target changed: ${file.path}`);
-    const current = bytesDigest(await readOptional(target));
-    if (current !== file.before && current !== file.after) throw new Error(`Concurrent file change: ${file.path}`);
+    if (await recoveryFileState(target, file, journal, committed)) continue;
     const desired = committed ? file.after : file.before;
-    if (current === desired) continue;
     const bytes = await readJournalBlob(directory, `${index}.${committed ? 'after' : 'before'}`, desired);
     if (bytes === null) await fs.unlink(target);
-    else await atomicWrite(target, bytes);
+    else await atomicWrite(target, bytes, (committed ? file.afterMode : file.beforeMode)!);
   }
-  if (!equalBytes(await readOptional(configPath), committed ? after : before)) throw new Error(`Config revision changed; recovery material retained at ${root}.`);
+  if (!await matchesJournalConfig(configPath, journal, committed ? after : before, committed)) throw new Error(`Config revision or permissions changed; recovery material retained at ${root}.`);
   if (committed) {
     for (const relative of [...journal.cleanupDirectories].sort((a, b) => b.length - a.length)) {
       const target = await physicalProjectPath(projectDir, relative);
@@ -441,7 +506,7 @@ async function finishJournal(projectDir: string, root: string, journal: Migratio
   }
   // Keep raw backups for inspection; a completed receipt is never replayed.
   await fs.rename(path.join(root, 'active.json'), path.join(directory, committed ? 'committed.json' : 'rolled-back.json'));
-  logSkillTarget('recovery:complete', { operation: journal.id, committed });
+  logSkillTarget('[FIX:155] recovery:complete', { operation: journal.id, committed, modesPreserved: journal.version === 2 });
 }
 
 export async function recoverSkillMigration(projectDir: string): Promise<void> {
@@ -450,9 +515,9 @@ export async function recoverSkillMigration(projectDir: string): Promise<void> {
     const bytes = await readOptional(path.join(root, 'active.json'));
     if (!bytes) return;
     const { journal, before, after } = await verifyJournal(projectDir, root, JSON.parse(bytes.toString('utf8')));
-    const current = await readOptional(path.join(projectDir, '.ai-factory.json'));
-    if (!equalBytes(current, before) && !equalBytes(current, after)) throw new Error(`Config revision conflicts with pending migration. Recovery material retained at ${root}.`);
-    const committed = equalBytes(current, after);
+    const configPath = path.join(projectDir, '.ai-factory.json');
+    const committed = await matchesJournalConfig(configPath, journal, after, true);
+    if (!committed && !await matchesJournalConfig(configPath, journal, before, false)) throw new Error(`Config revision or permissions conflict with pending migration. Recovery material retained at ${root}.`);
     console.log(`[skill-migration] Recovering ${journal.id} (${committed ? 'finish cleanup' : 'rollback destination'}).`);
     await finishJournal(projectDir, root, journal, committed);
   });
@@ -466,7 +531,7 @@ export async function applySkillMigration(
     const root = await checkedRuntimeRoot(projectDir);
     if (await readOptional(path.join(root, 'active.json'))) throw new Error('Pending skill migration must be recovered before applying another plan.');
     const configPath = path.join(projectDir, '.ai-factory.json');
-    if (!equalBytes(await readOptional(configPath), plan.configBefore)) throw new Error('Config revision changed after migration preflight. No installed files were changed.');
+    if (!await matchesFile(configPath, plan.configBefore, plan.configBeforeMode)) throw new Error('Config revision or permissions changed after migration preflight. No installed files were changed.');
     // Preserve raw native ownership and unknown config fields; only skill fields belong to this transaction.
     const rawConfig = (plan.configBefore ? JSON.parse(plan.configBefore.toString('utf8')) : structuredClone(plan.config)) as AiFactoryConfig & { agent?: string; skillsDir?: string };
     if (!Array.isArray(rawConfig.agents)) {
@@ -483,17 +548,19 @@ export async function applySkillMigration(
     if (!plan.files.length && equalBytes(after, plan.configBefore)) return plan.config;
     const id = randomUUID();
     const directory = path.join(root, id);
-    await fs.mkdir(directory);
-    const journal: MigrationJournal = { version: 1, id, phase: 'prepared', configBefore: bytesDigest(plan.configBefore),
-      configAfter: bytesDigest(after)!, files: [], cleanupDirectories: plan.cleanupDirectories };
-    if (plan.configBefore) await fs.writeFile(path.join(directory, 'config.before'), plan.configBefore, { flag: 'wx' });
-    await fs.writeFile(path.join(directory, 'config.after'), after, { flag: 'wx' });
+    await fs.mkdir(directory, { mode: 0o700 });
+    const journal: MigrationJournal = { version: 2, id, phase: 'prepared', configBefore: bytesDigest(plan.configBefore),
+      configAfter: bytesDigest(after)!, configBeforeMode: plan.configBeforeMode, configAfterMode: plan.configBeforeMode ?? 0o600,
+      files: [], cleanupDirectories: plan.cleanupDirectories };
+    if (plan.configBefore) await fs.writeFile(path.join(directory, 'config.before'), plan.configBefore, { flag: 'wx', mode: 0o600 });
+    await fs.writeFile(path.join(directory, 'config.after'), after, { flag: 'wx', mode: 0o600 });
     for (const [index, file] of plan.files.entries()) {
       const physical = await physicalProjectPath(projectDir, file.path);
-      if (!equalBytes(await readOptional(physical), file.before)) throw new Error(`File changed after preflight: ${file.path}`);
-      journal.files.push({ path: file.path, physical, before: bytesDigest(file.before), after: bytesDigest(file.after) });
-      if (file.before) await fs.writeFile(path.join(directory, `${index}.before`), file.before, { flag: 'wx' });
-      if (file.after) await fs.writeFile(path.join(directory, `${index}.after`), file.after, { flag: 'wx' });
+      if (!await matchesFile(physical, file.before, file.beforeMode)) throw new Error(`File or permissions changed after preflight: ${file.path}`);
+      journal.files.push({ path: file.path, physical, before: bytesDigest(file.before), after: bytesDigest(file.after),
+        beforeMode: file.beforeMode, afterMode: file.afterMode });
+      if (file.before) await fs.writeFile(path.join(directory, `${index}.before`), file.before, { flag: 'wx', mode: 0o600 });
+      if (file.after) await fs.writeFile(path.join(directory, `${index}.after`), file.after, { flag: 'wx', mode: 0o600 });
     }
     const writeJournal = () => atomicWrite(path.join(root, 'active.json'), Buffer.from(JSON.stringify(journal)));
     await verifyJournal(projectDir, root, journal);
@@ -507,18 +574,22 @@ export async function applySkillMigration(
         if (!file.after) continue; // Sources survive until the config commit is durable.
         const physical = await physicalProjectPath(projectDir, file.path, { preserveCase: true });
         const identity = process.platform === 'win32' ? physical.toLowerCase() : physical;
-        if (identity !== journal.files[index].physical || !equalBytes(await readOptional(physical), file.before)) throw new Error(`Concurrent destination change: ${file.path}`);
+        if (identity !== journal.files[index].physical || !await matchesFile(physical, file.before, file.beforeMode)) throw new Error(`Concurrent destination change or permissions change: ${file.path}`);
+        if (equalBytes(file.before, file.after) && file.beforeMode === file.afterMode) {
+          logSkillTarget('[FIX:155] migration:verified-unchanged-destination', { target: file.path });
+          continue;
+        }
         // The physical identity is case-folded on Windows. Preserve the proven
         // source spelling when creating files so managed hashes stay identical.
-        await atomicWrite(physical, file.after);
+        await atomicWrite(physical, file.after, file.afterMode!);
       }
       await options.onPhase?.('destination');
       for (const [index, file] of plan.files.entries()) {
         const physical = await physicalProjectPath(projectDir, file.path);
-        if (physical !== journal.files[index].physical || !equalBytes(await readOptional(physical), file.after ?? file.before)) throw new Error(`Concurrent migration file change: ${file.path}`);
+        if (physical !== journal.files[index].physical || !await matchesFile(physical, file.after ?? file.before, file.after !== null ? file.afterMode : file.beforeMode)) throw new Error(`Concurrent migration file change or permissions change: ${file.path}`);
       }
-      if (!equalBytes(await readOptional(configPath), plan.configBefore)) throw new Error('Concurrent config revision change before migration commit.');
-      await atomicWrite(configPath, after);
+      if (!await matchesFile(configPath, plan.configBefore, plan.configBeforeMode)) throw new Error('Concurrent config revision or permissions change before migration commit.');
+      await atomicWrite(configPath, after, journal.configAfterMode!);
       journal.phase = 'committed';
       await writeJournal();
       await options.onPhase?.('committed');
@@ -568,25 +639,46 @@ export async function prepareSkillTargets(
 
 export async function captureSharedSkillRollback(
   projectDir: string, agents: AgentInstallation[], names: readonly string[],
+  options: { includeSingletons?: boolean } = {},
 ): Promise<() => Promise<void>> {
   const snapshots: { relative: string; physical: string; tree: TreeInventory | null }[] = [];
+  const flatFiles: { relative: string; physical: string; before: Buffer | null; mode: number | null }[] = [];
   for (const group of await resolveSkillTargets(projectDir, agents, { select: false })) {
-    if (group.targets.length < 2 || !group.targets.every(target => ['codex', 'codex-app'].includes(target.id))) continue;
+    if (!options.includeSingletons && (group.targets.length < 2 || !group.targets.every(target => ['codex', 'codex-app'].includes(target.id)))) continue;
     for (const name of new Set(names.map(name => path.posix.basename(name.replaceAll('\\', '/'))))) {
       if (!name || name === '.' || name === '..') throw new Error('Unsafe shared rollback skill name.');
-      const relative = `${group.skillsDir}/${name}`;
+      const transformed = getTransformer(group.targets[0].id).transform(name, '');
+      if (transformed.flat) {
+        const relative = `${group.context.agent.configDir}/${transformed.targetDir}/${transformed.targetName}`;
+        const physical = await physicalProjectPath(projectDir, relative);
+        flatFiles.push({ relative, physical, before: await readOptional(physical), mode: await readMode(physical) });
+      }
+      const relative = transformed.flat ? `${group.context.agent.configDir}/${transformed.targetDir}/references`
+        : `${group.skillsDir}/${transformed.targetDir}`;
       const physical = await physicalProjectPath(projectDir, relative);
-      snapshots.push({ relative, physical, tree: await inventory(physical) });
+      if (!snapshots.some(snapshot => snapshot.physical === physical)) snapshots.push({ relative, physical, tree: await inventory(physical) });
     }
   }
   return async () => {
+    for (const file of flatFiles) {
+      if (await physicalProjectPath(projectDir, file.relative) !== file.physical) throw new Error(`Flat rollback target changed: ${file.relative}`);
+      const target = await physicalProjectPath(projectDir, file.relative, { preserveCase: true });
+      if (await matchesFile(target, file.before, file.mode)) continue;
+      if (file.before === null) await fs.unlink(target).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      else await atomicWrite(target, file.before, file.mode!);
+      logSkillTarget('[FIX:155] replacement:restored-flat-snapshot', { target: file.relative });
+    }
     for (const snapshot of snapshots) {
       if (await physicalProjectPath(projectDir, snapshot.relative) !== snapshot.physical) throw new Error(`Shared rollback target changed: ${snapshot.relative}`);
       const current = await inventory(snapshot.physical);
-      for (const [relative, bytes] of snapshot.tree?.files ?? []) await atomicWrite(path.join(snapshot.physical, relative), bytes);
+      for (const [relative, bytes] of snapshot.tree?.files ?? []) {
+        if (equalBytes(current?.files.get(relative) ?? null, bytes) && current?.modes.get(relative) === snapshot.tree!.modes.get(relative)) continue;
+        await atomicWrite(path.join(snapshot.physical, relative), bytes, snapshot.tree!.modes.get(relative)!);
+      }
       for (const relative of current?.files.keys() ?? []) {
         if (!snapshot.tree?.files.has(relative)) await fs.unlink(path.join(snapshot.physical, relative));
       }
+      logSkillTarget('[FIX:155] replacement:restored-snapshot', { target: snapshot.relative, files: snapshot.tree?.files.size ?? 0 });
       for (const relative of snapshot.tree?.directories ?? []) await fs.mkdir(path.join(snapshot.physical, relative), { recursive: true });
       for (const relative of [...(current?.directories ?? [])].sort((a, b) => b.length - a.length)) {
         if (!snapshot.tree?.directories.includes(relative)) await fs.rmdir(path.join(snapshot.physical, relative)).catch(error => {
