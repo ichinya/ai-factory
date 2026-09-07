@@ -95,6 +95,8 @@ The `agents` array can include any built-in agent IDs plus runtime IDs provided 
 
 Extension-provided agent files can target non-Claude runtimes such as Codex. Those files are often bounded helper workers (for example, one-shot reviewers or plan polishers), not automatic equivalents of the bundled Claude coordinator agents. Documentation and prompts should describe those support boundaries explicitly instead of implying full parity across runtimes. AI Factory copies those runtime-specific agent files verbatim; runtime-local keys such as `model`, `model_reasoning_effort`, `sandbox_mode`, and `developer_instructions` belong in the agent file itself rather than in `.ai-factory.json` or workflow prompts. For bounded Codex helpers, prefer read-only advisory workers unless the runtime-native agent truly owns writes to a specific artifact.
 
+Bundled Codex roles leave `model` and `model_reasoning_effort` unset to inherit the parent session's settings. These fields are optional per-role overrides; common `[agents]` defaults and supported explicit spawn parameters can select a model when the role does not pin one. See [Codex CLI Bundled Agents](subagents.md#codex-cli-bundled-agents) for precedence and reload instructions.
+
 Agent-file lifecycle is now consistent across the CLI:
 - `extension add` installs the file, records `installedAgentFiles`, records `agentFileSources`, and writes fresh `managedAgentFiles` hashes immediately.
 - `ai-factory update` preserves tracked extension-owned agent files even when an extension manifest is temporarily missing, warns, and skips only the source-driven drift healing that cannot be resolved safely.

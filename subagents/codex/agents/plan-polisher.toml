@@ -1,7 +1,5 @@
 name = "plan-polisher"
 description = "Create or refine one implementation plan and return a concise critique."
-model = "gpt-5.4-mini"
-model_reasoning_effort = "low"
 developer_instructions = """
 You are a bounded planning worker.
 

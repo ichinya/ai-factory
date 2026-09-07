@@ -50,17 +50,21 @@ If you edit these files manually, reload them in the target runtime (`/agents` i
 
 Codex receives the same narrow planning/implementation/review contract shape as Claude, translated into TOML agent files:
 
-| Agent | Purpose | Model |
-|---|---|---|
-| `plan-coordinator` | own parent planning session and delegate bounded plan polish passes | `gpt-5.4` |
-| `plan-polisher` | create or refine exactly one implementation plan and critique it | `gpt-5.4-mini` |
-| `implement-coordinator` | own parent implementation session and delegate bounded edits and read-only audits | `gpt-5.4` |
-| `implement-worker` | execute one bounded implementation task | `gpt-5.4-mini` |
-| `best-practices-sidecar` | read-only maintainability audit | `gpt-5.4-mini` |
-| `commit-preparer` | read-only commit-readiness audit | `gpt-5.4-mini` |
-| `docs-auditor` | read-only documentation drift audit | `gpt-5.4-mini` |
-| `review-sidecar` | read-only correctness review | `gpt-5.4-mini` |
-| `security-sidecar` | read-only security review | `gpt-5.4-mini` |
+| Agent | Purpose |
+|---|---|
+| `plan-coordinator` | own parent planning session and delegate bounded plan polish passes |
+| `plan-polisher` | create or refine exactly one implementation plan and critique it |
+| `implement-coordinator` | own parent implementation session and delegate bounded edits and read-only audits |
+| `implement-worker` | execute one bounded implementation task |
+| `best-practices-sidecar` | read-only maintainability audit |
+| `commit-preparer` | read-only commit-readiness audit |
+| `docs-auditor` | read-only documentation drift audit |
+| `review-sidecar` | read-only correctness review |
+| `security-sidecar` | read-only security review |
+
+Bundled Codex agents omit `model` and `model_reasoning_effort`, so they inherit the parent session's model and reasoning effort by default. If configured, `[agents].default_subagent_model` and `[agents].default_subagent_reasoning_effort` take precedence over parent inheritance. Explicit spawn parameters take precedence over those defaults when supported by the runtime and context-fork mode. Selecting a different model without an explicit effort may use that model's default effort.
+
+To pin an individual role, add `model` and `model_reasoning_effort` to its `.codex/agents/<name>.toml`; role-file values have the highest priority. Remove those fields to restore inheritance, and restart or reload Codex after editing agent definitions. See [Codex custom agents](https://developers.openai.com/codex/subagents/#custom-agents) for the native selection rules.
 
 Codex also receives a managed `.codex/config.toml` with conservative `[agents]` defaults so native agent orchestration works in freshly initialized projects. That file is intentionally package-managed by AI Factory and is tracked through `installedConfigFiles` / `managedConfigFiles` in `.ai-factory.json`; `ai-factory update` may overwrite local drift in `.codex/config.toml` to restore the managed defaults.
 

@@ -1,7 +1,5 @@
 name = "implement-worker"
 description = "Execute one bounded implementation task and report results back to the coordinator."
-model = "gpt-5.4-mini"
-model_reasoning_effort = "medium"
 developer_instructions = """
 You are a bounded implementation worker.
 

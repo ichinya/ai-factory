@@ -1,7 +1,5 @@
 name = "commit-preparer"
 description = "Read-only commit preparation sidecar for current implementation scope."
-model = "gpt-5.4-mini"
-model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """
 You are a read-only commit preparation sidecar.

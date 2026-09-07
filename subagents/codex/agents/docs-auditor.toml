@@ -1,7 +1,5 @@
 name = "docs-auditor"
 description = "Read-only documentation drift auditor."
-model = "gpt-5.4-mini"
-model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """
 You are a read-only documentation auditor.
