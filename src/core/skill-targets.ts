@@ -113,8 +113,8 @@ export async function resolveSkillTargets(
       reason: preferShared ? 'existing-agents-directory' as const : runtime.skillsDir ? 'persisted' as const : 'default' as const,
     });
     targets.push(target);
-    const assets = [registry.agentsDir, registry.settingsFile,
-      ...(registry.configFiles ?? []).map(file => `${registry.configDir}/${file}`)].filter((value): value is string => !!value);
+    const assets = [registry.agentsDir, runtime.agentsDir, registry.settingsFile,
+      ...new Set([...(registry.configFiles ?? []), ...(runtime.configFiles ?? [])].map(file => `${registry.configDir}/${file}`))].filter((value): value is string => !!value);
     for (const asset of assets) protectedPaths.push(await physicalProjectPath(projectDir, asset));
     logSkillTarget('resolved', { ...target });
   }
@@ -152,7 +152,7 @@ export async function hasSurvivingConfigConsumer(
   const target = await physicalProjectPath(projectDir, relativePath);
   for (const survivor of survivors) {
     const runtime = getAgentConfig(survivor.id);
-    const paths = [runtime.settingsFile, ...(runtime.configFiles ?? []).map(file => `${runtime.configDir}/${file}`)]
+    const paths = [runtime.settingsFile, ...new Set([...(runtime.configFiles ?? []), ...(survivor.configFiles ?? [])].map(file => `${runtime.configDir}/${file}`))]
       .filter((file): file is string => !!file);
     for (const file of paths) if (await physicalProjectPath(projectDir, file) === target) return true;
   }

@@ -498,6 +498,8 @@ ai-factory upgrade
 | `src/cli/wizard/prompts.ts` | Interactive CLI questions |
 | `src/core/agents.ts` | Agent registry (16 agents) |
 | `src/core/installer.ts` | Copies skills to project |
+| `src/core/skill-targets.ts` | Resolves physical skill targets, shared rendering profiles, and native-path boundaries |
+| `src/core/skills-migration.ts` | Proves skill ownership and performs journaled skill-only migration/recovery |
 | `src/core/mcp.ts` | MCP server configuration |
 | `src/core/template.ts` | `{{var}}` template substitution in SKILL.md |
 | `src/core/transformer.ts` | AgentTransformer interface + registry |
@@ -532,8 +534,8 @@ docs/
 ├── evolve.md                # Patch-driven skill evolution and skill-context learning loop
 ├── plan-files.md            # Plan files, self-improvement patches, skill acquisition strategy
 ├── security.md              # Two-level security scanning system
-├── extensions.md            # Extension commands, injections, MCP, runtimes, and agent files
-├── configuration.md         # .ai-factory.json, MCP config, project structure, best practices
+├── extensions.md            # Extension commands, shared skill composition, injections, MCP, runtimes, and agent files
+├── configuration.md         # .ai-factory.json, Codex skill targets and recovery, MCP config, project structure
 └── config-reference.md      # Full config.yaml schema, defaults, and skill read/write matrix
 ```
 

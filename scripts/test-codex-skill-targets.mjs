@@ -55,11 +55,12 @@ function runInit(project, agents = 'codex') {
   assert.equal(result.status, 0, `init ${agents} failed: ${result.error?.message ?? result.stderr}`);
 }
 
-function runUpdate(project, force = false) {
+function runUpdate(project, force = false, expectSuccess = true) {
   const url = pathToFileURL(path.join(root, 'dist/cli/commands/update.js')).href;
   const code = `globalThis.fetch = async () => ({ok:true,status:200,headers:{get:()=>null},json:async()=>({version:'2.19.0'})}); const { updateCommand } = await import(${JSON.stringify(url)}); await updateCommand({force:${force}});`;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: project, encoding: 'utf8', timeout: 60000 });
-  assert.equal(result.status, 0, `update failed: ${result.error?.message ?? result.stderr}\n${result.stdout}`);
+  if (expectSuccess) assert.equal(result.status, 0, `update failed: ${result.error?.message ?? result.stderr}\n${result.stdout}`);
+  else assert.notEqual(result.status, 0, 'update unexpectedly succeeded');
   return result.stdout;
 }
 
@@ -155,6 +156,22 @@ test('cli', 'empty CLI/App init migrates on update and stays stable on repeated 
   await assert.rejects(fs.access(path.join(project, '.codex/skills/aif/SKILL.md')));
 });
 
+test('cli', 'shared update preserves different per-runtime selections and their union', async project => {
+  const agents = [installation('codex', '.agents/skills', ['aif']), installation('codex-app', '.agents/skills', ['aif-plan'])];
+  const [group] = await resolveSkillTargets(project, agents, { select: false });
+  await installSkills({ projectDir: project, agentId: 'codex', skillsDir: group.skillsDir, skills: ['aif', 'aif-plan'], renderContext: group.context });
+  for (const agent of agents) agent.managedSkills = await buildManagedSkillsState(project, agent, agent.installedSkills, group.context);
+  for (const order of [agents, [...agents].reverse()]) {
+    await saveConfig(project, { version: '2.19.0', agents: order }, { hydrateAgentFileSources: false });
+    const before = await snapshot(path.join(project, '.agents/skills'));
+    runUpdate(project);
+    const saved = await loadConfig(project);
+    assert.deepEqual(saved.agents.find(agent => agent.id === 'codex').installedSkills, ['aif']);
+    assert.deepEqual(saved.agents.find(agent => agent.id === 'codex-app').installedSkills, ['aif-plan']);
+    assert.deepEqual(await snapshot(path.join(project, '.agents/skills')), before);
+  }
+});
+
 for (const survivor of ['codex', 'codex-app']) {
   test('cli', `re-init retains shared skills/config when only ${survivor} remains`, async project => {
     await fs.mkdir(path.join(project, '.agents'));
@@ -172,7 +189,89 @@ for (const survivor of ['codex', 'codex-app']) {
   });
 }
 
+test('cli', 'first init defaults are independent of CLI/App selection order', async project => {
+  for (const [index, agents] of ['codex,codex-app', 'codex-app,codex'].entries()) {
+    const directory = path.join(project, String(index));
+    await fs.mkdir(directory);
+    runInit(directory, agents);
+    const config = await loadConfig(directory);
+    assert.equal(config.agents.find(agent => agent.id === 'codex').skillsDir, '.codex/skills');
+    assert.equal(config.agents.find(agent => agent.id === 'codex-app').skillsDir, '.agents/skills');
+  }
+});
+
+test('cli', 're-init restores persisted shared and custom paths without reverting', async project => {
+  for (const [index, skillsDir] of ['.agents/skills', '.team/skills'].entries()) {
+    const directory = path.join(project, String(index));
+    await fs.mkdir(directory);
+    await saveConfig(directory, { version: '2.19.0', agents: [installation('codex', skillsDir)] }, { hydrateAgentFileSources: false });
+    runInit(directory);
+    assert.equal((await loadConfig(directory)).agents[0].skillsDir, skillsDir);
+    await fs.access(path.join(directory, skillsDir, 'aif/SKILL.md'));
+  }
+});
+
+test('cli', 'extension mutations reject incompatible targets and list remains read-only', async project => {
+  const config = { version: '2.19.0', agents: [installation('codex', '.agents/skills'), installation('universal', '.agents/skills')],
+    extensions: [{ name: 'aif-ext-guard', version: '1.0.0', source: './extension-source' }] };
+  await saveConfig(project, config, { hydrateAgentFileSources: false });
+  await fs.mkdir(path.join(project, '.agents/skills/aif'), { recursive: true });
+  await fs.writeFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'existing user bytes');
+  await fs.mkdir(path.join(project, 'extension-source'));
+  await fs.writeFile(path.join(project, 'extension-source/extension.json'), JSON.stringify({ name: 'aif-ext-guard', version: '1.0.0' }));
+  const before = await snapshot(path.join(project, '.agents'));
+  const configBefore = await fs.readFile(path.join(project, '.ai-factory.json'));
+  const url = pathToFileURL(path.join(root, 'dist/cli/commands/extension.js')).href;
+  for (const [command, argument] of [['extensionAddCommand', './extension-source'], ['extensionUpdateCommand', 'aif-ext-guard'], ['extensionRemoveCommand', 'aif-ext-guard']]) {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `const m=await import(${JSON.stringify(url)}); await m[${JSON.stringify(command)}](${JSON.stringify(argument)});`], { cwd: project, encoding: 'utf8', timeout: 60000 });
+    assert.notEqual(result.status, 0, `${command} should reject the incompatible target`);
+    assert.match(result.stderr + result.stdout, /Incompatible/);
+    assert.deepEqual(await snapshot(path.join(project, '.agents')), before);
+    assert.deepEqual(await fs.readFile(path.join(project, '.ai-factory.json')), configBefore);
+  }
+  const beforeList = await snapshot(project);
+  const listed = spawnSync(process.execPath, ['--input-type=module', '-e', `const m=await import(${JSON.stringify(url)}); await m.extensionListCommand();`], { cwd: project, encoding: 'utf8', timeout: 60000 });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.deepEqual(await snapshot(project), beforeList);
+});
+
 let failures = 0;
+test('upgrade', 'v1 Codex upgrade selects .agents before legacy cleanup', async project => {
+  await fs.mkdir(path.join(project, '.agents'));
+  await fs.mkdir(path.join(project, '.codex/skills/commit'), { recursive: true });
+  await fs.writeFile(path.join(project, '.codex/skills/commit/SKILL.md'), 'legacy commit');
+  await fs.mkdir(path.join(project, '.codex/skills/user'));
+  await fs.writeFile(path.join(project, '.codex/skills/user/SKILL.md'), 'user skill');
+  await fs.writeFile(path.join(project, '.codex/config.toml'), 'user native config');
+  await fs.writeFile(path.join(project, '.ai-factory.json'), JSON.stringify({ version: '1.0.0', agent: 'codex', skillsDir: '.codex/skills', installedSkills: ['commit'] }));
+  const url = pathToFileURL(path.join(root, 'dist/cli/commands/upgrade.js')).href;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `const m=await import(${JSON.stringify(url)}); await m.upgradeCommand();`], { cwd: project, encoding: 'utf8', timeout: 60000 });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal((await loadConfig(project)).agents[0].skillsDir, '.agents/skills');
+  await fs.access(path.join(project, '.agents/skills/aif-commit/SKILL.md'));
+  await assert.rejects(fs.access(path.join(project, '.codex/skills/commit/SKILL.md')));
+  await assert.rejects(fs.access(path.join(project, '.codex/skills/aif-commit/SKILL.md')));
+  assert.equal(await fs.readFile(path.join(project, '.codex/skills/user/SKILL.md'), 'utf8'), 'user skill');
+  assert.equal(await fs.readFile(path.join(project, '.codex/config.toml'), 'utf8'), 'user native config');
+});
+
+test('upgrade', 'incompatible upgrade fails before legacy file/directory changes', async project => {
+  const agents = [installation('codex', '.agents/skills', ['commit']), installation('universal', '.agents/skills', ['commit'])];
+  await fs.mkdir(path.join(project, '.agents/skills/commit'), { recursive: true });
+  await fs.writeFile(path.join(project, '.agents/skills/commit/SKILL.md'), 'legacy');
+  await fs.mkdir(path.join(project, '.ai-factory/changes'), { recursive: true });
+  await fs.writeFile(path.join(project, '.ai-factory/changes/task.md'), 'old plan');
+  await saveConfig(project, { version: '1.0.0', agents }, { hydrateAgentFileSources: false });
+  const before = await snapshot(path.join(project, '.agents'));
+  const configBefore = await fs.readFile(path.join(project, '.ai-factory.json'));
+  const url = pathToFileURL(path.join(root, 'dist/cli/commands/upgrade.js')).href;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `const m=await import(${JSON.stringify(url)}); await m.upgradeCommand();`], { cwd: project, encoding: 'utf8', timeout: 60000 });
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(await snapshot(path.join(project, '.agents')), before);
+  assert.deepEqual(await fs.readFile(path.join(project, '.ai-factory.json')), configBefore);
+  await fs.access(path.join(project, '.ai-factory/changes/task.md'));
+});
+
 test('ownership', 'removing either runtime preserves surviving skills and shared native config', async project => {
   const agents = [installation('codex', '.agents/skills'), installation('codex-app', '.agents/skills')];
   const [group] = await resolveSkillTargets(project, agents, { select: false });
@@ -207,7 +306,13 @@ test('extensions', 'shared replacements project outcomes and apply one injection
   await fs.writeFile(path.join(source, 'replacement/SKILL.md'), '---\nname: replacement\ndescription: replacement\n---\nReplacement {{skills_dir}} /aif-plan\n');
   await fs.writeFile(path.join(source, 'demo/SKILL.md'), '---\nname: demo\ndescription: demo\n---\nCustom\n');
   await fs.writeFile(path.join(source, 'injection.md'), 'Injected once');
-  const manifest = { name: 'aif-ext-target-fixture', version: '1.0.0', skills: ['replacement', 'demo'], replaces: { replacement: 'aif' }, injections: [{ target: 'aif', position: 'append', file: 'injection.md' }] };
+  await fs.writeFile(path.join(source, 'prepend.md'), 'Prepended once');
+  const manifest = { name: 'aif-ext-target-fixture', version: '1.0.0', skills: ['replacement', 'demo'], replaces: { replacement: 'aif' }, injections: [{ target: 'aif', position: 'append', file: 'injection.md' }, { target: 'aif', position: 'prepend', file: 'prepend.md' }] };
+  const injectionOnly = { name: 'aif-ext-injection-failure', version: '1.0.0', injections: manifest.injections, mcpServers: [{ key: 'broken', template: {} }] };
+  await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(injectionOnly));
+  const beforeInjectionFailure = await snapshot(path.join(project, '.agents/skills'));
+  await assert.rejects(commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest: injectionOnly, cleanup: async () => {} } }));
+  assert.deepEqual(await snapshot(path.join(project, '.agents/skills')), beforeInjectionFailure);
   await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(manifest));
   const result = await commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest, cleanup: async () => {} } });
   await saveConfig(project, config, { hydrateAgentFileSources: false });
@@ -215,18 +320,25 @@ test('extensions', 'shared replacements project outcomes and apply one injection
   const outcomes = await installExtensionAssetsForAllAgents(project, config.agents, result.extensionDir, manifest);
   assert.equal(outcomes.replacementOutcomes[0].successCount, 2);
   assert.equal(outcomes.replacementOutcomes[0].agentCount, 2);
-  assert.equal(outcomes.injectionCount, 1);
-  assert.equal(await composeInstalledExtensionSkills(project, config), 1);
+  assert.equal(outcomes.injectionCount, 2);
+  assert.equal(await composeInstalledExtensionSkills(project, config), 2);
   const content = await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8');
   assert.ok(content.includes('Replacement .agents/skills $aif-plan'));
   assert.equal(content.split('Injected once').length - 1, 1);
+  assert.equal(content.split('Prepended once').length - 1, 1);
   await fs.access(path.join(project, '.agents/skills/demo/SKILL.md'));
   const skillsBeforeFailure = await snapshot(path.join(project, '.agents/skills'));
+  runInit(project, 'codex-app,codex');
+  assert.deepEqual(await snapshot(path.join(project, '.agents/skills')), skillsBeforeFailure);
   const invalid = { ...manifest, version: '2.0.0', mcpServers: [{ key: 'broken', template: {} }] };
   await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(invalid));
   await fs.writeFile(path.join(source, 'replacement/SKILL.md'), '---\nname: replacement\n---\nChanged version');
   await assert.rejects(commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest: invalid, cleanup: async () => {} } }));
   assert.deepEqual(await snapshot(path.join(project, '.agents/skills')), skillsBeforeFailure);
+  const upgradeUrl = pathToFileURL(path.join(root, 'dist/cli/commands/upgrade.js')).href;
+  const upgraded = spawnSync(process.execPath, ['--input-type=module', '-e', `const m=await import(${JSON.stringify(upgradeUrl)}); await m.upgradeCommand();`], { cwd: project, encoding: 'utf8', timeout: 60000 });
+  assert.equal(upgraded.status, 0, upgraded.stderr + upgraded.stdout);
+  assert.ok((await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8')).includes('Replacement'));
   await fs.unlink(path.join(getExtensionsDir(project), manifest.name, 'extension.json'));
   await stripInjectionsForAllAgents(project, config.agents, manifest.name);
   assert.ok(!(await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8')).includes('Injected once'));
@@ -257,6 +369,59 @@ test('migration', 'migration preserves native bytes and metadata and is repeatab
   await assert.rejects(fs.access(path.join(project, '.codex/skills/aif/SKILL.md')));
   await recoverSkillMigration(project);
   assert.equal((await preflightSkillMigration(project, await loadConfig(project))).files.length, 0);
+});
+
+test('migration', 'failed replacement keeps bundled ownership during later migration', async project => {
+  const config = await legacyProject(project);
+  await fs.rmdir(path.join(project, '.agents'));
+  const source = path.join(project, 'failed-replacement-source');
+  await fs.mkdir(source);
+  const manifest = { name: 'aif-ext-failed-replacement', version: '1.0.0', skills: ['missing'], replaces: { missing: 'aif' } };
+  await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(manifest));
+  await commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest, cleanup: async () => {} } });
+  await saveConfig(project, config, { hydrateAgentFileSources: false });
+  assert.deepEqual(config.extensions[0].replacedSkills ?? [], []);
+  await fs.mkdir(path.join(project, '.agents'));
+  await applySkillMigration(project, await preflightSkillMigration(project, config));
+  const saved = await loadConfig(project);
+  assert.equal(saved.agents[0].skillsDir, '.agents/skills');
+  assert.ok(saved.agents[0].managedSkills.aif);
+  await assert.rejects(fs.access(path.join(project, '.codex/skills/aif/SKILL.md')));
+});
+
+test('migration', 'installed extension composition migrates without stale bundled receipts', async project => {
+  const config = await legacyProject(project);
+  await fs.rmdir(path.join(project, '.agents'));
+  const source = path.join(project, 'extension-source');
+  await fs.mkdir(path.join(source, 'replacement'), { recursive: true });
+  await fs.mkdir(path.join(source, 'demo'));
+  await fs.writeFile(path.join(source, 'replacement/SKILL.md'), '---\nname: replacement\n---\nReplace {{skills_dir}} /aif-plan');
+  await fs.writeFile(path.join(source, 'demo/SKILL.md'), '---\nname: demo\n---\nCustom {{skills_dir}}');
+  await fs.writeFile(path.join(source, 'append.md'), 'Extension injection');
+  const manifest = { name: 'aif-ext-migration', version: '1.0.0', skills: ['replacement', 'demo'], replaces: { replacement: 'aif' }, injections: [{ target: 'aif', position: 'append', file: 'append.md' }] };
+  await fs.writeFile(path.join(source, 'extension.json'), JSON.stringify(manifest));
+  await commitResolvedExtension(project, { config, source, resolved: { sourceDir: source, manifest, cleanup: async () => {} } });
+  await saveConfig(project, config, { hydrateAgentFileSources: false });
+  await fs.mkdir(path.join(project, '.agents'));
+  const helper = path.join(project, '.codex/skills/aif/references/config-template.yaml');
+  const helperBytes = await fs.readFile(helper);
+  await fs.appendFile(helper, '\nuser edit');
+  const modified = await snapshot(path.join(project, '.codex'));
+  await assert.rejects(preflightSkillMigration(project, config), /differs from its known source/);
+  assert.deepEqual(await snapshot(path.join(project, '.codex')), modified);
+  await fs.writeFile(helper, helperBytes);
+  await applySkillMigration(project, await preflightSkillMigration(project, config));
+  const saved = await loadConfig(project);
+  assert.equal(saved.agents[0].skillsDir, '.agents/skills');
+  assert.equal(saved.agents[0].managedSkills.aif, undefined);
+  await assert.rejects(fs.access(path.join(project, '.agents/skills/aif/references/config-template.yaml')));
+  const content = await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8');
+  assert.ok(content.includes('Replace .agents/skills $aif-plan'));
+  assert.equal(content.split('Extension injection').length - 1, 1);
+  await fs.access(path.join(project, '.agents/skills/demo/SKILL.md'));
+  assert.equal((await preflightSkillMigration(project, saved)).files.length, 0);
+  runUpdate(project);
+  assert.ok((await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8')).includes('Replace .agents/skills'));
 });
 
 for (const phase of ['prepared', 'destination']) {
@@ -309,6 +474,112 @@ test('migration', 'project lock rejects concurrent independent operations', asyn
   await assert.rejects(withSkillProjectLock(project, async () => assert.fail('must not execute')), /Another AI Factory operation/);
 });
 
+test('migration', 'native failure after migration keeps the committed target', async project => {
+  await legacyProject(project);
+  await fs.mkdir(path.join(project, 'native-target'));
+  await fs.writeFile(path.join(project, 'native-target/user.toml'), 'native user file');
+  try {
+    await fs.symlink(path.join(project, 'native-target'), path.join(project, '.codex/agents'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (!['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) throw error;
+    console.log(`CAPABILITY native failure integration unavailable (${error.code}); journal/config boundary checks still run`);
+    return;
+  }
+  assert.ok((await fs.lstat(path.join(project, '.codex/agents'))).isSymbolicLink());
+  runUpdate(project, false, false);
+  assert.equal((await loadConfig(project)).agents[0].skillsDir, '.agents/skills');
+  await fs.access(path.join(project, '.agents/skills/aif/SKILL.md'));
+  await assert.rejects(fs.access(path.join(project, '.codex/skills/aif/SKILL.md')));
+  assert.equal(await fs.readFile(path.join(project, 'native-target/user.toml'), 'utf8'), 'native user file');
+  await assert.rejects(fs.access(path.join(project, '.ai-factory/skill-migrations/active.json')));
+});
+
+test('migration', 'force does not bypass an unproven migration baseline', async project => {
+  const config = await legacyProject(project);
+  config.agents[0].managedSkills = {};
+  await saveConfig(project, config, { hydrateAgentFileSources: false });
+  const before = await snapshot(path.join(project, '.codex'));
+  const configBefore = await fs.readFile(path.join(project, '.ai-factory.json'));
+  runUpdate(project, true, false);
+  assert.deepEqual(await snapshot(path.join(project, '.codex')), before);
+  assert.deepEqual(await fs.readFile(path.join(project, '.ai-factory.json')), configBefore);
+});
+
+for (const operation of ['destination-write', 'config-save']) {
+  test('migration', `filesystem ${operation} failure restores the baseline`, async project => {
+    const config = await legacyProject(project);
+    const plan = await preflightSkillMigration(project, config);
+    const before = await snapshot(path.join(project, '.codex'));
+    const configBefore = await fs.readFile(path.join(project, '.ai-factory.json'));
+    const originalRename = fs.rename;
+    let failed = false;
+    fs.rename = async (source, destination) => {
+      const target = String(destination).replaceAll('\\', '/');
+      const matches = operation === 'config-save' ? target.endsWith('/.ai-factory.json') : target.includes('/.agents/skills/') && !target.endsWith('.tmp');
+      if (!failed && matches) { failed = true; throw Object.assign(new Error('injected filesystem failure'), { code: 'EACCES' }); }
+      return originalRename(source, destination);
+    };
+    try { await assert.rejects(applySkillMigration(project, plan), /rolled back/); }
+    finally { fs.rename = originalRename; }
+    assert.ok(failed, 'fault injection did not exercise the filesystem operation');
+    assert.deepEqual(await snapshot(path.join(project, '.codex')), before);
+    assert.deepEqual(await fs.readFile(path.join(project, '.ai-factory.json')), configBefore);
+  });
+}
+
+test('migration', 'concurrent source edits stop cleanup and remain recoverable', async project => {
+  const config = await legacyProject(project);
+  const source = path.join(project, '.codex/skills/aif/SKILL.md');
+  await assert.rejects(applySkillMigration(project, await preflightSkillMigration(project, config), {
+    onPhase: async phase => { if (phase === 'destination') await fs.appendFile(source, '\nconcurrent source edit'); },
+  }), /Concurrent|concurrent/);
+  assert.ok((await fs.readFile(source, 'utf8')).endsWith('concurrent source edit'));
+  assert.equal((await loadConfig(project)).agents[0].skillsDir, '.codex/skills');
+  await fs.access(path.join(project, '.ai-factory/skill-migrations/active.json'));
+});
+
+test('migration', 'verified duplicate consolidates while unknown empty directories survive', async project => {
+  const config = await legacyProject(project);
+  await fs.cp(path.join(project, '.codex/skills/aif'), path.join(project, '.agents/skills/aif'), { recursive: true });
+  await fs.mkdir(path.join(project, '.codex/skills/aif/user-empty'));
+  await applySkillMigration(project, await preflightSkillMigration(project, config));
+  await fs.access(path.join(project, '.codex/skills/aif/user-empty'));
+  await assert.rejects(fs.access(path.join(project, '.codex/skills/aif/SKILL.md')));
+  assert.ok((await fs.readFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'utf8')).includes('.agents/skills/'));
+});
+
+test('migration', 'same physical alias is rendered without deleting its target', async project => {
+  const config = await legacyProject(project);
+  await fs.rename(path.join(project, '.codex/skills'), path.join(project, '.agents/skills'));
+  try {
+    await fs.symlink(path.join(project, '.agents/skills'), path.join(project, '.codex/skills'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (!['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) throw error;
+    console.log(`CAPABILITY native alias migration unavailable (${error.code}); deterministic alias policy remains covered`);
+    return;
+  }
+  assert.ok((await fs.lstat(path.join(project, '.codex/skills'))).isSymbolicLink());
+  const plan = await preflightSkillMigration(project, config);
+  assert.ok(plan.files.every(file => file.after !== null));
+  await applySkillMigration(project, plan);
+  await fs.access(path.join(project, '.agents/skills/aif/SKILL.md'));
+  assert.ok((await fs.lstat(path.join(project, '.codex/skills'))).isSymbolicLink());
+});
+
+test('migration', 'recovery refuses a tampered path outside recorded skill roots', async project => {
+  const config = await legacyProject(project);
+  await assert.rejects(applySkillMigration(project, await preflightSkillMigration(project, config), {
+    onPhase: async phase => { if (phase === 'committed') throw new Error('leave cleanup pending'); },
+  }), /pending cleanup/);
+  const journalPath = path.join(project, '.ai-factory/skill-migrations/active.json');
+  const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'));
+  journal.files[0].path = '.codex/config.toml';
+  await fs.writeFile(journalPath, JSON.stringify(journal));
+  const before = await snapshot(path.join(project, '.codex'));
+  await assert.rejects(recoverSkillMigration(project), /Recovery path/);
+  assert.deepEqual(await snapshot(path.join(project, '.codex')), before);
+});
+
 test('preflight', 'preflight plans a proven move without writing bytes', async project => {
   const config = await legacyProject(project);
   await fs.mkdir(path.join(project, '.codex/skills/user-skill'));
@@ -322,11 +593,13 @@ test('preflight', 'preflight plans a proven move without writing bytes', async p
   assert.deepEqual(await snapshot(project), before);
 });
 
-for (const mode of ['missing-state', 'local-edit', 'unknown-file', 'injection-edit', 'destination-conflict']) {
+for (const mode of ['missing-state', 'changed-source', 'missing-manifest', 'local-edit', 'unknown-file', 'injection-edit', 'destination-conflict']) {
   test('preflight', `preflight preserves all bytes on ${mode}`, async project => {
     const config = await legacyProject(project);
     const skill = path.join(project, '.codex/skills/aif');
     if (mode === 'missing-state') config.agents[0].managedSkills = {};
+    if (mode === 'changed-source') config.agents[0].managedSkills.aif.sourceHash = 'unavailable-old-revision';
+    if (mode === 'missing-manifest') config.extensions = [{ name: 'aif-ext-missing', version: '1.0.0', source: './missing' }];
     if (mode === 'local-edit') await fs.appendFile(path.join(skill, 'SKILL.md'), '\nlocal change');
     if (mode === 'unknown-file') await fs.writeFile(path.join(skill, 'local-note'), 'private notes');
     if (mode === 'injection-edit') await fs.appendFile(path.join(skill, 'SKILL.md'), '\n<!-- aif-ext:demo:aif:append:start -->\nchanged\n<!-- aif-ext:demo:aif:append:end -->\n');
@@ -335,7 +608,7 @@ for (const mode of ['missing-state', 'local-edit', 'unknown-file', 'injection-ed
       await fs.writeFile(path.join(project, '.agents/skills/aif/SKILL.md'), 'user destination');
     }
     const before = await snapshot(project);
-    await assert.rejects(preflightSkillMigration(project, config), /baseline|conflict|source/i);
+    await assert.rejects(preflightSkillMigration(project, config), /baseline|conflict|source|manifest/i);
     assert.deepEqual(await snapshot(project), before);
   });
 }
@@ -360,6 +633,7 @@ test('targets', 'resolver uses one snapshot and preserves persisted/custom targe
   assert.equal(shared[0].skillsDir, '.agents/skills');
   assert.equal(shared[0].context.agent.displayName, 'Codex');
   assert.equal((await resolveSkillTargets(project, [installation('codex', '.team/skills')]))[0].skillsDir, '.team/skills');
+  assert.equal((await resolveSkillTargets(project, [installation('codex', '.team\\skills')]))[0].skillsDir, '.team/skills');
   await fs.rmdir(path.join(project, '.agents'));
   assert.equal((await resolveSkillTargets(project, [installation('codex', '.agents/skills')]))[0].skillsDir, '.agents/skills');
   await fs.writeFile(path.join(project, '.agents'), 'ordinary file');
@@ -372,6 +646,8 @@ test('targets', 'resolver rejects escaping, nested, native and incompatible targ
   }
   await assert.rejects(resolveSkillTargets(project, [installation('codex', '.agents/skills'), installation('codex-app', '.agents/skills/child')]));
   await assert.rejects(resolveSkillTargets(project, [installation('codex', '.agents/skills'), installation('universal', '.agents/skills')]), /Incompatible/);
+  await assert.rejects(resolveSkillTargets(project, [{ ...installation('codex', '.team/skills'), agentsDir: '.team/skills/native' }]), /overlap/);
+  await assert.rejects(resolveSkillTargets(project, [{ ...installation('codex', '.codex/custom'), configFiles: ['custom/config.toml'] }]), /overlap/);
 });
 
 test('targets', 'physical aliases share a target without a separate cleanup source', async project => {

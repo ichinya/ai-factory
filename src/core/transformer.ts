@@ -27,6 +27,8 @@ export interface AgentOnboarding {
 export interface SkillTargetRuntime {
   id: string;
   skillsDir: string;
+  agentsDir?: string;
+  configFiles?: string[];
 }
 
 export const WORKFLOW_SKILLS = new Set([

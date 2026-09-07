@@ -781,6 +781,8 @@ async function commitResolvedExtensionLocked(
   const restoreSharedSkills = await captureSharedSkillRollback(projectDir, config.agents, [
     ...Object.values(manifest.replaces ?? {}), ...(manifest.skills ?? []),
     ...Object.values(oldManifest?.replaces ?? {}), ...(oldManifest?.skills ?? []),
+    ...(manifest.injections ?? []).map(injection => injection.target),
+    ...(oldManifest?.injections ?? []).map(injection => injection.target),
   ]);
   let discardBackup = true;
 
@@ -798,12 +800,12 @@ async function commitResolvedExtensionLocked(
       : null;
     try {
       await rollbackFailedExtensionInstall(projectDir, config.agents, {
-      extensionDir,
-      backupDir,
-      oldRecord,
-      oldManifest,
-      newManifest: manifest,
-      partialAssetInstall,
+        extensionDir,
+        backupDir,
+        oldRecord,
+        oldManifest,
+        newManifest: manifest,
+        partialAssetInstall,
       });
       await restoreSharedSkills();
     } catch (rollbackError) {

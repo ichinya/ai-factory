@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AgentInstallation, AiFactoryConfig, ManagedSkillState } from './config.js';
 import { loadConfig } from './config.js';
+import { getAgentConfig } from './agents.js';
 import { loadAllExtensions, type InstalledExtensionManifest } from './extensions.js';
 import { getAvailableSkills, buildManagedSkillsState, renderSkillFiles } from './installer.js';
 import { getSkillsDir } from '../utils/fs.js';
@@ -15,6 +16,7 @@ interface SkillOwner {
   sourceDir: string;
   key: string;
   extension: boolean;
+  bundledSourceDir?: string;
 }
 
 interface TreeInventory {
@@ -111,7 +113,8 @@ export async function collectSkillOwners(
       if (existing && existing.key !== key && !(replaces && !existing.extension)) {
         throw new Error(`Conflicting skill owners for "${name}": ${existing.key} and ${key}. Use explicit replaces for a bundled skill.`);
       }
-      owners.set(name, { name, sourceDir: path.join(dir, normalized), key, extension: true });
+      owners.set(name, { name, sourceDir: path.join(dir, normalized), key, extension: true,
+        ...(replaces && existing && !existing.extension ? { bundledSourceDir: existing.sourceDir } : {}) });
     }
   }
   return owners;
@@ -140,11 +143,19 @@ export async function preflightSkillMigration(
   config: AiFactoryConfig,
   groups?: readonly SkillTargetGroup[],
 ): Promise<SkillMigrationPlan> {
+  const configBefore = await readOptional(path.join(projectDir, '.ai-factory.json'));
   const resolved = groups ?? await resolveSkillTargets(projectDir, config.agents);
   const previousGroups = await resolveSkillTargets(projectDir, config.agents, { select: false });
   const extensions = await loadAllExtensions(projectDir, (config.extensions ?? []).map(extension => extension.name));
   if (extensions.length !== (config.extensions ?? []).length) throw new Error('Missing installed extension manifest; resolve it before skill migration.');
-  const owners = await collectSkillOwners(extensions);
+  await collectSkillOwners(extensions); // Declared source collisions fail even after a partial install.
+  const owners = await collectSkillOwners(extensions.map(extension => {
+    const applied = new Set(config.extensions?.find(record => record.name === extension.manifest.name)?.replacedSkills ?? []);
+    return { ...extension, manifest: { ...extension.manifest,
+      skills: extension.manifest.skills?.filter(relative => !extension.manifest.replaces?.[relative] || applied.has(extension.manifest.replaces[relative])),
+      replaces: Object.fromEntries(Object.entries(extension.manifest.replaces ?? {}).filter(([, name]) => applied.has(name))),
+    } };
+  }));
   const next = structuredClone(config);
   const files = new Map<string, MigrationFile>();
   const cleanupDirectories = new Set<string>();
@@ -159,10 +170,19 @@ export async function preflightSkillMigration(
   for (const group of resolved) {
     const participants = group.targets.map(target => config.agents.find(agent => agent.id === target.id)).filter((agent): agent is AgentInstallation => !!agent);
     const needsMigration = group.targets.some(target => target.previousSkillsDir !== target.skillsDir)
+      || participants.some(agent => previousGroups.find(previous => previous.targets.some(target => target.id === agent.id))?.context.hash !== group.context.hash)
       || participants.some(agent => Object.values(agent.managedSkills ?? {}).some(state => state.renderContextHash && state.renderContextHash !== group.context.hash));
     if (!needsMigration) continue;
     const names = new Set(participants.flatMap(agent => agent.installedSkills.map(name => path.posix.basename(name.replaceAll('\\', '/')))));
     for (const owner of owners.values()) if (owner.extension) names.add(owner.name);
+    for (const target of group.targets) {
+      if (target.sourcePhysicalPath === group.physicalPath) continue;
+      const entries = await fs.readdir(target.sourcePhysicalPath).catch(error => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      });
+      for (const entry of entries) if (!names.has(entry)) warnings.push(`Preserving unmanaged entry: ${target.previousSkillsDir}/${entry}`);
+    }
     logSkillTarget('preflight:start', { target: group.skillsDir, skills: [...names] });
     for (const name of names) {
       if (!name || name === '.' || name === '..' || /[/\\]/.test(name)) throw new Error(`Unsafe installed skill name: ${name}`);
@@ -178,6 +198,20 @@ export async function preflightSkillMigration(
         if (!tree) continue;
         const oldContext = previousGroups.find(previous => previous.targets.some(target => target.id === agent.id))!.context;
         const expected = await renderComposition(owner, agent.id, oldContext, extensions);
+        // Existing replacement installs overlay the bundled directory. Prove each
+        // surviving bundled helper before cleaning up the obsolete base files.
+        if (owner.bundledSourceDir && [...tree.files.keys()].some(relative => !expected.has(relative))) {
+          const state = (await buildManagedSkillsState(projectDir, agent, [name], oldContext))[name];
+          if (agent.managedSkills?.[name]?.sourceHash !== state?.sourceHash || !state) {
+            throw new Error(`Unproven bundled files beneath replacement "${directory}".`);
+          }
+          const baseline = await renderSkillFiles(owner.bundledSourceDir, name, agent.id, oldContext);
+          for (const relative of tree.files.keys()) {
+            if (!expected.has(relative) && baseline.has(relative)) {
+              expected.set(relative, baseline.get(relative)!);
+            }
+          }
+        }
         if (!equalFiles(tree.files, expected)) throw new Error(`Skill migration conflict: "${directory}" differs from its known source (including injections or unknown files). Preserve both copies and resolve local changes.`);
         if (!owner.extension) {
           const state = (await buildManagedSkillsState(projectDir, agent, [name], oldContext))[name];
@@ -201,6 +235,9 @@ export async function preflightSkillMigration(
         throw new Error(`Skill migration conflict: "${destination}" and "${proofs[0].directory}" differ. No files were changed.`);
       }
       for (const [relative, bytes] of finalFiles) addFile(`${destination}/${relative}`, destinationTree?.files.get(relative) ?? null, bytes);
+      for (const [relative, bytes] of destinationTree?.files ?? []) {
+        if (!finalFiles.has(relative)) addFile(`${destination}/${relative}`, bytes, null);
+      }
       for (const proof of proofs) {
         if (proof.physical === destinationPath) continue;
         for (const [relative, bytes] of proof.tree.files) addFile(`${proof.directory}/${relative}`, bytes, null);
@@ -218,6 +255,7 @@ export async function preflightSkillMigration(
       const sourceState = !owner.extension ? (await buildManagedSkillsState(projectDir, participants.find(agent => agent.managedSkills?.[name])!, [name]))[name] : null;
       for (const agent of next.agents.filter(agent => participants.some(participant => participant.id === agent.id))) {
         agent.managedSkills ??= {};
+        if (owner.extension) delete agent.managedSkills[name]; // A replacement must not retain the old bundled-skill receipt.
         if (sourceState && agent.installedSkills.includes(name)) {
           const state: ManagedSkillState = { sourceHash: sourceState.sourceHash, installedHash: managedHash(finalFiles), renderContextHash: group.context.hash };
           agent.managedSkills[name] = state;
@@ -228,7 +266,8 @@ export async function preflightSkillMigration(
       if (participants.some(participant => participant.id === agent.id)) agent.skillsDir = group.skillsDir;
     }
   }
-  return { config: next, configBefore: await readOptional(path.join(projectDir, '.ai-factory.json')), groups: resolved,
+  if (!equalBytes(await readOptional(path.join(projectDir, '.ai-factory.json')), configBefore)) throw new Error('Config revision changed during migration preflight. Retry after resolving concurrent edits.');
+  return { config: next, configBefore, groups: resolved,
     files: [...files.values()], cleanupDirectories: [...cleanupDirectories], warnings };
 }
 
@@ -330,15 +369,18 @@ async function verifyJournal(
   const before = await readJournalBlob(directory, 'config.before', journal.configBefore);
   const after = await readJournalBlob(directory, 'config.after', journal.configAfter);
   if (!after) throw new Error('Missing committed config snapshot.');
-  const snapshots: AiFactoryConfig[] = [JSON.parse(after.toString('utf8'))];
+  const snapshots: Array<AiFactoryConfig & { agent?: string; skillsDir?: string }> = [JSON.parse(after.toString('utf8'))];
   if (before) snapshots.push(JSON.parse(before.toString('utf8')));
   const allowedRoots = new Set<string>();
   for (const config of snapshots) {
-    if (!Array.isArray(config.agents)) throw new Error('Invalid recovery config.');
-    const groups = await resolveSkillTargets(projectDir, config.agents, { select: false });
+    const runtimes = Array.isArray(config.agents) ? config.agents
+      : typeof config.agent === 'string' ? [{ id: config.agent, skillsDir: typeof config.skillsDir === 'string' ? config.skillsDir : getAgentConfig(config.agent).skillsDir }] : null;
+    if (!runtimes) throw new Error('Invalid recovery config.');
+    const groups = await resolveSkillTargets(projectDir, runtimes, { select: false });
     for (const group of groups) allowedRoots.add(group.physicalPath);
   }
   const seen = new Set<string>();
+  const allowedCleanup = new Set<string>();
   for (const [index, file] of journal.files.entries()) {
     if (!file || typeof file.path !== 'string' || typeof file.physical !== 'string') throw new Error('Invalid recovery file entry.');
     const actual = await physicalProjectPath(projectDir, file.path);
@@ -346,13 +388,20 @@ async function verifyJournal(
       throw new Error(`Recovery path changed or escaped its skill root: ${file.path}`);
     }
     seen.add(actual);
+    if (file.after === null) {
+      let parent = path.dirname(actual);
+      while ([...allowedRoots].some(allowed => parent.startsWith(`${allowed}${path.sep}`))) {
+        allowedCleanup.add(parent);
+        parent = path.dirname(parent);
+      }
+    }
     await readJournalBlob(directory, `${index}.before`, file.before);
     await readJournalBlob(directory, `${index}.after`, file.after);
   }
   for (const relative of journal.cleanupDirectories) {
     if (typeof relative !== 'string') throw new Error('Invalid cleanup directory.');
     const actual = await physicalProjectPath(projectDir, relative);
-    if (![...allowedRoots].some(allowed => actual.startsWith(`${allowed}${path.sep}`))) throw new Error(`Unsafe cleanup directory: ${relative}`);
+    if (!allowedCleanup.has(actual)) throw new Error(`Unsafe cleanup directory: ${relative}`);
   }
   return { journal, directory, before, after };
 }
@@ -417,9 +466,12 @@ export async function applySkillMigration(
     const configPath = path.join(projectDir, '.ai-factory.json');
     if (!equalBytes(await readOptional(configPath), plan.configBefore)) throw new Error('Config revision changed after migration preflight. No installed files were changed.');
     // Preserve raw native ownership and unknown config fields; only skill fields belong to this transaction.
-    const rawConfig = plan.configBefore ? JSON.parse(plan.configBefore.toString('utf8')) as AiFactoryConfig : structuredClone(plan.config);
-    if (!Array.isArray(rawConfig.agents)) throw new Error('Upgrade the legacy config schema before migrating managed skills.');
-    for (const agent of rawConfig.agents) {
+    const rawConfig = (plan.configBefore ? JSON.parse(plan.configBefore.toString('utf8')) : structuredClone(plan.config)) as AiFactoryConfig & { agent?: string; skillsDir?: string };
+    if (!Array.isArray(rawConfig.agents)) {
+      if (plan.config.agents.length !== 1 || rawConfig.agent !== plan.config.agents[0].id) throw new Error('Invalid legacy config schema for skill migration.');
+      rawConfig.skillsDir = plan.config.agents[0].skillsDir;
+    }
+    for (const agent of rawConfig.agents ?? []) {
       const next = plan.config.agents.find(candidate => candidate.id === agent.id);
       if (!next) continue;
       agent.skillsDir = next.skillsDir;
@@ -492,9 +544,12 @@ export async function prepareSkillTargets(
       if (recovered) Object.assign(config, recovered);
     }
     const resolved = groups ?? await resolveSkillTargets(projectDir, config.agents);
+    const previousGroups = await resolveSkillTargets(projectDir, config.agents, { select: false });
     const extensions = await loadAllExtensions(projectDir, (config.extensions ?? []).map(extension => extension.name));
     await collectSkillOwners(extensions);
     const needsMigration = resolved.some(group => group.targets.some(target => target.previousSkillsDir !== target.skillsDir)
+      || config.agents.filter(agent => group.targets.some(target => target.id === agent.id))
+        .some(agent => previousGroups.find(previous => previous.targets.some(target => target.id === agent.id))?.context.hash !== group.context.hash)
       || config.agents.filter(agent => group.targets.some(target => target.id === agent.id))
         .some(agent => Object.values(agent.managedSkills ?? {}).some(state => state.renderContextHash && state.renderContextHash !== group.context.hash)));
     if (needsMigration) {

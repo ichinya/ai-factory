@@ -4,9 +4,9 @@ Branch: feat/issue-155-codex-skills-target
 Base branch: 2.x
 Base commit: e144f95c89de0d0cb6c9b38dbe8c2907b00dc5ce
 Created: 2026-09-07
-Updated: 2026-09-07 — aif-improve
-Status: implementing
-Current task: 9
+Updated: 2026-09-07 — aif-implement
+Status: complete
+Current task: none
 Mode: full
 
 ## Original Request
@@ -234,33 +234,35 @@ init и upgrade должны учитывать эту композицию; т�
 
 ### Phase 3: Upgrade, проверка и документация
 
-- [ ] Task 9: Согласовать upgrade с target guard и extension composition.
+- [x] Task 9: Согласовать upgrade с target guard и extension composition.
   Deliverable: подготовить targets/recovery до legacy rename/remove; применить тот же safe migration path с отдельным commit boundary до обычных native writes; сохранить существующую v1→v2 семантику, восстанавливая актуальные extension replacements/custom skills/injections для затронутого target до итогового state. Подключить соответствующие upgrade regression cases.
   Files: src/cli/commands/upgrade.ts, src/core/skills-migration.ts, src/core/extension-ops.ts, src/core/installer.ts, scripts/test-update.sh.
   Acceptance: legacy codex layout с .agents конвертируется без возрождения второго managed набора; несовместимый shared target блокирует upgrade до первой legacy mutation; extension replacement не заменяется незаметно stock skill; non-Codex upgrade fixtures остаются зелёными.
   Logging: INFO chosen target и upgrade summary; DEBUG legacy/current operation mapping; ERROR конфликт до destructive action с remediation; WARN остающиеся неизвестные legacy entries.
   Depends on: Tasks 5, 6, 8.
 
-- [ ] Task 10: Завершить регрессионное покрытие migration/shared lifecycle.
+- [x] Task 10: Завершить регрессионное покрытие migration/shared lifecycle.
   Deliverable: расширить исходные checks Task 1 матрицей ниже, включая реальный failure recovery и checks installed bytes/config state. Использовать существующие isolated temp fixtures и offline extension fixtures; не запускать CLI над рабочим проектом.
   Files: scripts/test-init.sh, scripts/test-update.sh, scripts/test-extensions.sh, scripts/test-extension-fixtures.sh, scripts/test-codex-skill-targets.mjs из Task 1.
   Acceptance: все строки Verification Matrix имеют executable coverage; тесты проверяют конечный filesystem/state, а не только строку лога или внутреннюю реализацию. Создавать links через Node fs, используя junction на Windows; проверять lstat().isSymbolicLink() и realpath тем же runtime, которым работает проверяемый код. При недоступной native capability явно отметить непроверенную интеграцию и обязательно выполнить deterministic resolver/boundary-policy checks; plain skip не считается покрытием границ. Windows separator/alias cases обязательны также на другом host.
   Logging: scenario IDs, command results, digest mismatch paths и recovery phase; захватывать LOG_LEVEL=debug только для failing-case диагностики; не выводить секреты из fixtures.
   Depends on: Tasks 5, 6, 7, 8, 9.
 
-- [ ] Task 11: Обновить пользовательские контракты через $aif-docs.
+- [x] Task 11: Обновить пользовательские контракты через $aif-docs.
   Deliverable: документировать таблицу выбора, persisted overrides, defaults пустого проекта, совместимость CLI/App и конфликт Universal, порядок безопасной миграции и конкретное действие при unresolved conflicts/recovery. Уточнить, что перемещение skills не меняет native asset paths и не гарантирует исчезновение budget warning.
   Files: docs/getting-started.md, docs/configuration.md, docs/subagents.md, docs/extensions.md; README.md и AGENTS.md только если их краткие сведения требуют согласования.
   Acceptance: docs соответствуют итоговой реализации; нет инструкции удалить всю .codex; отсутствует обещание автоматического merge локальных правок. Описать singleton/shared render behavior, config-conflict recovery и границу завершённой миграции при ошибке последующего update. Обновить существующие неточные формулировки о перезаписи пользовательского Codex config в затронутых абзацах согласно фактической policy. Не менять unrelated roadmap/research/context artifacts.
   Logging: runtime logging не добавляется; документация объясняет LOG_LEVEL=debug и реальные диагностические сообщения. Зафиксировать docs checkpoint как выполненную задачу, без отдельного отчёта.
   Depends on: Tasks 6, 7, 8, 9, 10.
 
-- [ ] Task 12: Выполнить итоговую квалификацию изменения.
+- [x] Task 12: Выполнить итоговую квалификацию изменения.
   Deliverable: выполнить Verification Commands, проверить final diff, task coverage, отсутствие unrelated/staging artifacts в коммитах и восстановление повторного запуска на fixtures. Отметить задачи выполненными только по результатам реально выполненных checks.
   Files: изменённые source/tests/docs и этот plan file для progress; отдельный report file не создавать.
-  Acceptance: build, affected lifecycle checks и полный npm test проходят; исходные untracked файлы сохранены; unresolved custody/compatibility failures отсутствуют. Непроверенные платформенные сценарии явно перечислены в handoff и не выдаются за PASS.
+  Acceptance: build, affected lifecycle checks и полный npm test проходят; unrelated файлы сохранены, кроме устаревших untracked subagents/*.md, которые пользователь отдельно поручил удалить; unresolved custody/compatibility failures отсутствуют. Непроверенные платформенные сценарии явно перечислены в handoff и не выдаются за PASS.
   Logging: кратко указать команды, результат и material limitations; не дублировать полный test output.
   Depends on: Tasks 10, 11.
+
+  Evidence (2026-09-07): npm run build, npm run lint, новая regression matrix и полный npm test прошли; итог suite — 147 passed / 0 failed, 12 предупреждений о длине существующих skills. Полный suite включил update/init/extensions checks; дополнительные проверки union разных runtime selections, injection-only rollback и preserved-base после неудачного replacement также прошли. Windows junction/lstat/realpath cases выполнены; Linux/macOS локально не запускались. Три Python-блока штатно пропущены (Python 3 отсутствует); hosted CI проверяется отдельно после push. В Windows использован TEMP/TMP/TMPDIR на диске checkout для существующих npm resolver fixtures. Проверены 40 относительных docs links/anchors и git diff --check; Original Request сохранён. Untracked файлов перед commit нет; исходные устаревшие subagents/*.md удалены по отдельному запросу пользователя. Повторный fetch подтвердил прежний upstream/2.x.
 
 ## Verification Matrix
 

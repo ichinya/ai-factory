@@ -487,11 +487,21 @@ The replacement skill is installed **under the base skill name**. For example, `
 **On update** (`ai-factory update`):
 1. Replaced base skills are **skipped** during reinstallation
 2. Extension replacement skills are re-installed from `.ai-factory/extensions/`
-3. If the extension manifest is missing/broken, the base skill is **restored** automatically
+3. If the extension manifest is missing/broken, the ordinary update can restore the base skill. A pending skill-directory migration instead stops before changing installed files because it cannot prove the replacement's source.
 
 **On remove** (`extension remove`):
 1. The replacement skill is removed (by its base name)
 2. The original base skill is **restored** — unless another extension still replaces it
+
+#### Shared Skill Targets
+
+When Codex CLI and Codex app share a physical skill directory, base skills, replacements, custom skills, and injections are composed once per target. Results still count both runtimes, and each append/prepend injection marker occurs once. Re-init, update, and upgrade restore the registered extension composition after base installation.
+
+Extensions must have unambiguous skill ownership. Two different custom sources with the same basename conflict, even within one extension. A custom skill cannot claim a bundled name unless the manifest explicitly declares `replaces`. These conflicts and incompatible shared renderers are checked before installed skill changes.
+
+During [skill migration](configuration.md#codex-skill-directories-and-migration), the installed extension version and actual replacement/custom/injection bytes must be provable. Old bundled helpers left beneath a replacement are removed only when their source can also be verified. Unknown or modified files block migration. A failed extension refresh restores the previous shared skill bytes; failure after a completed migration keeps the committed target.
+
+The shared profile applies only when CLI and app use the same physical directory. Singleton metadata and runtime-specific MCP support remain unchanged. Removing an extension restores eligible base skills and removes its injection markers from the actual target, including name-based marker cleanup when the manifest is missing and no migration is pending.
 
 #### Example
 
