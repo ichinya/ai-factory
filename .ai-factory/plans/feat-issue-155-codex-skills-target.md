@@ -5,7 +5,8 @@ Base branch: 2.x
 Base commit: e144f95c89de0d0cb6c9b38dbe8c2907b00dc5ce
 Created: 2026-09-07
 Updated: 2026-09-07 — aif-improve
-Status: planned
+Status: implementing
+Current task: 5
 Mode: full
 
 ## Original Request
@@ -173,28 +174,28 @@ init и upgrade должны учитывать эту композицию; т�
 
 ### Phase 1: Контракт назначения и preflight
 
-- [ ] Task 1: Подготовить регрессионные fixtures и проверки исходной проблемы.
+- [x] Task 1: Подготовить регрессионные fixtures и проверки исходной проблемы.
   Deliverable: воспроизводимые temp-project сценарии для пустой .agents, обоих каталогов, direct install с override и неверных template links. Добавить raw snapshot helper для последующих custody assertions; сохранять одни и те же checks для проверки исправления. Разделить core и CLI scenario groups в отдельном runner: CLI cases сначала запускаются явно как ожидаемые failing regressions, а в штатные smoke suites подключаются вместе с готовой CLI-интеграцией в Tasks 8–10.
   Files: scripts/test-codex-skill-targets.mjs (new), scripts/test-extension-fixtures.sh; изменения вызовов в scripts/test-init.sh/test-update.sh/test-extensions.sh выполняются при соответствующей интеграции.
   Acceptance: до исправления выбранные opt-in regression checks падают по ожидаемой причине, существующие control cases проходят; fixtures не используют текущую рабочую установку, сеть или модель. Стандартные suites не получают заведомо падающие CLI cases до подключения реализации; core checks подключать по мере завершения Tasks 2–4.
   Logging: выводить scenario/command/path и конкретное failed assertion; не печатать содержимое config или навыков целиком. Production logging не добавляется.
   Depends on: none.
 
-- [ ] Task 2: Реализовать единый resolver effective skill targets и групп участников.
+- [x] Task 2: Реализовать единый resolver effective skill targets и групп участников.
   Deliverable: core-модуль src/core/skill-targets.ts с разрешением C1, immutable context, filesystem snapshot до writes, сохранением persisted overrides, физической нормализацией targets и типизированными причинами выбора. Отдельно сохранить static runtime asset config.
   Files: src/core/skill-targets.ts (new), src/core/agents.ts, src/core/transformer.ts, src/core/config.ts только при необходимости типов/совместимого чтения.
   Acceptance: вся таблица C1; оба порядка CLI/App дают одинаковые назначения; сохранённый общий путь не откатывается; пользовательский override и non-Codex defaults сохранены; .agents-файл/unsafe alias не принимается как безопасный каталог. Same-physical-target не запускает source cleanup; ancestor/descendant overlaps отклоняются, включая отсутствующий target под существующим alias.
   Logging: DEBUG [skill-targets] runtime IDs, previous/effective target, reason и group membership; INFO только при реальной смене target; ERROR с конкретным path при недопустимом назначении. Использовать LOG_LEVEL и существующий callback pattern.
   Depends on: Task 1.
 
-- [ ] Task 3: Передать согласованный render context во все skill installers.
+- [x] Task 3: Передать согласованный render context во все skill installers.
   Deliverable: реализовать C2 в installSkills/installExtensionSkills/installSkillWithTransformer и template pipeline; отделить подготовку rendered content от записи, чтобы migration могла подготовить результат в staging с финальными template paths. Проверять совместимость полного render profile и сохранять отдельные outcomes участников общего target; передавать renderContextHash через normalization, update decisions и итоговые receipts.
   Files: src/core/skill-targets.ts, src/core/installer.ts, src/core/template.ts, src/core/transformer.ts, src/core/config.ts, src/core/transformers/codex.ts только при необходимом согласовании profile.
   Acceptance: SKILL.md и references используют фактический target; helper commands не ссылаются на старую папку; $aif-* и relative links сохранены. Порядок codex/codex-app на общем target не меняет полный rendered tree. Singleton CLI/App metadata сохраняются; shared/singleton переход инвалидирует renderContextHash. Custom project paths не превращаются в неверные home paths. codex/universal отклоняется, остальные transformers и native hash normalization сохраняют поведение.
   Logging: DEBUG profile/group/skill и deduplicated write decision; не выводить rendered content. Сохранить существующие сообщения install errors, добавив target context.
   Depends on: Task 2.
 
-- [ ] Task 4: Реализовать read-only migration preflight с классификацией конфликтов.
+- [x] Task 4: Реализовать read-only migration preflight с классификацией конфликтов.
   Deliverable: src/core/skills-migration.ts возвращает planned operations и conflicts по C3 без writes. Inventory через lstat учитывает все entries, links/junctions и empty dirs. Отдельно проверяются base, replacement/custom extension provenance и injection differences. Построить owner map конечных skill paths по C2; source owner conflicts не устраняются выбором первого элемента group.
   Files: src/core/skills-migration.ts (new), src/core/installer.ts для переиспользуемого rendering/hash contract, src/core/extension-ops.ts для inventory metadata, src/utils/fs.ts только для узких reusable primitives.
   Acceptance: raw-identical verified copies разрешаются; modified/unknown/недоступные sources сохраняются; differing injection bytes дают conflict даже при равных managed hashes; missing hashes не превращаются в разрешение overwrite; inventory не выходит за допустимые roots. Два разных extension sources одного basename блокируются; явный корректный replaces остаётся разрешённым.

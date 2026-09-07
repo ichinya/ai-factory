@@ -20,6 +20,10 @@ export interface ManagedArtifactState {
   installedHash: string;
 }
 
+export interface ManagedSkillState extends ManagedArtifactState {
+  renderContextHash?: string;
+}
+
 export interface AgentFileSource {
   kind: 'bundled' | 'extension';
   sourcePath: string;
@@ -30,7 +34,7 @@ export interface AgentInstallation {
   id: string;
   skillsDir: string;
   installedSkills: string[];
-  managedSkills?: Record<string, ManagedArtifactState>;
+  managedSkills?: Record<string, ManagedSkillState>;
   agentsDir?: string;
   installedAgentFiles?: string[];
   agentFileSources?: Record<string, AgentFileSource>;
@@ -145,6 +149,15 @@ function normalizeManagedArtifacts(raw: unknown): Record<string, ManagedArtifact
     }
   }
 
+  return result;
+}
+
+function normalizeManagedSkills(raw: unknown): Record<string, ManagedSkillState> {
+  const result: Record<string, ManagedSkillState> = normalizeManagedArtifacts(raw);
+  for (const [name, state] of Object.entries(result)) {
+    const hash = (raw as Record<string, { renderContextHash?: unknown }>)[name]?.renderContextHash;
+    if (typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) state.renderContextHash = hash;
+  }
   return result;
 }
 
@@ -273,7 +286,7 @@ export async function loadConfig(projectDir: string): Promise<AiFactoryConfig | 
         id: agent.id,
         skillsDir,
         installedSkills: Array.isArray(legacyAgent.installedSkills) ? legacyAgent.installedSkills : [],
-        managedSkills: normalizeManagedArtifacts(legacyAgent.managedSkills),
+        managedSkills: normalizeManagedSkills(legacyAgent.managedSkills),
         agentsDir,
         installedAgentFiles,
         agentFileSources: filteredAgentFileSources,
