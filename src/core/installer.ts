@@ -22,7 +22,7 @@ import type { AgentFileSource, AgentInstallation, ManagedArtifactState, ManagedS
 import { getAgentConfig } from './agents.js';
 import { getExtensionsDir, type ExtensionManifest, type ExtensionAgentFile } from './extensions.js';
 import { processSkillTemplates, buildTemplateVars, processTemplate } from './template.js';
-import { createSkillRenderContext, logSkillTarget, type SkillRenderContext } from './skill-targets.js';
+import { createSkillRenderContext, logSkillTarget, physicalProjectPath, type SkillRenderContext } from './skill-targets.js';
 import { getTransformer, extractFrontmatterName, replaceFrontmatterName } from './transformer.js';
 
 const EXTENSION_INJECTION_BLOCK_PATTERN = /\n?<!-- aif-ext:[^:]+:[^:]+:[^:]+:start -->\n[\s\S]*?\n<!-- aif-ext:[^:]+:[^:]+:[^:]+:end -->\n?/g;
@@ -951,6 +951,51 @@ async function removeSkillsByName(
     }
   }
 
+  return removed;
+}
+
+export async function removeOwnedSkills(
+  projectDir: string, agent: AgentInstallation, survivors: readonly AgentInstallation[],
+): Promise<string[]> {
+  const target = await physicalProjectPath(projectDir, agent.skillsDir);
+  const consumers = await Promise.all(survivors.map(async survivor => ({
+    agent: survivor, target: await physicalProjectPath(projectDir, survivor.skillsDir),
+  })));
+  const removed: string[] = [];
+  for (const name of agent.installedSkills.filter(name => !name.includes('/'))) {
+    if (!name || name === '.' || name === '..' || name.includes('\\')) throw new Error(`Unsafe managed skill name: ${name}`);
+    const needed = consumers.some(consumer => consumer.target === target && consumer.agent.installedSkills.includes(name));
+    if (needed) {
+      logSkillTarget('remove:retain', { runtime: agent.id, skill: name, reason: 'surviving-consumer' });
+      continue;
+    }
+    const saved = agent.managedSkills?.[name];
+    const current = await getManagedSkillState(projectDir, agent, name);
+    if (!saved || !current || saved.installedHash !== current.installedHash) {
+      console.warn(`[skill-targets] Preserving unproven or modified skill: ${agent.skillsDir}/${name}`);
+      continue;
+    }
+    const transformer = getTransformer(agent.id).transform(name, '');
+    if (transformer.flat) {
+      await removeFile(path.join(projectDir, getAgentConfig(agent.id).configDir, transformer.targetDir, transformer.targetName));
+    } else {
+      const directory = path.join(target, transformer.targetDir);
+      if (lstatSync(directory).isSymbolicLink()) throw new Error(`Linked managed skill cannot be removed: ${directory}`);
+      const files = await listFilesRecursive(directory);
+      const directories = new Set([directory]);
+      for (const file of files) {
+        if (lstatSync(file).isSymbolicLink()) throw new Error(`Linked skill file cannot be removed: ${file}`);
+        let parent = path.dirname(file);
+        while (parent !== directory && parent.startsWith(`${directory}${path.sep}`)) { directories.add(parent); parent = path.dirname(parent); }
+        await removeFile(file);
+      }
+      for (const parent of [...directories].sort((a, b) => b.length - a.length)) {
+        await fs.rmdir(parent).catch(error => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
+      }
+    }
+    removed.push(name);
+    logSkillTarget('remove:complete', { runtime: agent.id, skill: name });
+  }
   return removed;
 }
 

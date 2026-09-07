@@ -20,8 +20,8 @@ import {
   updateSkills,
   updateSubagents,
 } from '../../core/installer.js';
-import {applyExtensionInjections} from '../../core/injections.js';
-import {assertCompatibleSkillTargets} from '../../core/transformer.js';
+import {resolveSkillTargets} from '../../core/skill-targets.js';
+import {prepareSkillTargets, withSkillProjectLock} from '../../core/skills-migration.js';
 import {
   installExtensionSkillsForAllAgents,
   installExtensionAgentFilesForAllAgents,
@@ -30,6 +30,7 @@ import {
   mergeAgentFileSources,
   mergeInstalledAgentFiles,
   refreshExtensions,
+  composeInstalledExtensionSkills,
 } from '../../core/extension-ops.js';
 import {fileExists} from '../../utils/fs.js';
 
@@ -206,6 +207,10 @@ async function selfUpdate(currentVersion: string): Promise<boolean> {
 }
 
 export async function updateCommand(options: UpdateCommandOptions = {}): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => updateLocked(options));
+}
+
+async function updateLocked(options: UpdateCommandOptions): Promise<void> {
   const projectDir = process.cwd();
   const force = Boolean(options.force);
 
@@ -223,7 +228,7 @@ export async function updateCommand(options: UpdateCommandOptions = {}): Promise
     extensionNames: config.extensions?.map(extension => extension.name) ?? [],
   });
 
-  assertCompatibleSkillTargets(config.agents);
+  await prepareSkillTargets(projectDir, config);
 
   const currentVersion = getCurrentVersion();
 
@@ -310,15 +315,27 @@ export async function updateCommand(options: UpdateCommandOptions = {}): Promise
 
     const selectedNewSkills = await promptForNewSkills(availableSkills, config.agents, allReplacedSkills);
 
-    for (const agent of config.agents) {
-      const result = await updateSkills(agent, projectDir, {
+    const groups = await resolveSkillTargets(projectDir, config.agents, { select: false });
+    for (const group of groups) {
+      const participants = config.agents.filter(agent => group.targets.some(target => target.id === agent.id));
+      const representative = { ...participants[0], skillsDir: group.skillsDir,
+        installedSkills: [...new Set(participants.flatMap(agent => agent.installedSkills))],
+        managedSkills: Object.assign({}, ...participants.map(agent => agent.managedSkills ?? {})),
+      };
+      const result = await updateSkills(representative, projectDir, {
         excludeSkills: [...allReplacedSkills],
         force,
         installNewSkills: selectedNewSkills,
+        renderContext: group.context,
       });
-      agent.installedSkills = result.installedSkills;
-      skillEntriesByAgent.set(agent.id, result.entries);
+      for (const agent of participants) {
+        const previous = new Set(agent.installedSkills);
+        agent.installedSkills = result.installedSkills.filter(skill => previous.has(skill) || selectedNewSkills.includes(skill));
+        skillEntriesByAgent.set(agent.id, result.entries.filter(entry => previous.has(entry.skill) || !representative.installedSkills.includes(entry.skill)));
+      }
+    }
 
+    for (const agent of config.agents) {
       const subagentResult = await updateSubagents(agent, projectDir, { force });
       agent.installedAgentFiles = subagentResult.installedAgentFiles;
       agent.agentFileSources = subagentResult.agentFileSources;
@@ -429,10 +446,7 @@ export async function updateCommand(options: UpdateCommandOptions = {}): Promise
 
     // Re-apply extension injections
     if (config.extensions?.length) {
-      let totalInjections = 0;
-      for (const agent of config.agents) {
-        totalInjections += await applyExtensionInjections(projectDir, agent, config.extensions!);
-      }
+      const totalInjections = await composeInstalledExtensionSkills(projectDir, config);
       if (totalInjections > 0) {
         console.log(chalk.green(`✓ Re-applied ${totalInjections} extension injection(s)`));
       }
@@ -443,7 +457,8 @@ export async function updateCommand(options: UpdateCommandOptions = {}): Promise
     for (const agent of config.agents) {
       const { base: baseSkills } = partitionSkills(agent.installedSkills);
       const managedBaseSkills = baseSkills.filter(skill => availableSkills.includes(skill) && !finalReplacedSkills.has(skill));
-      agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills);
+      agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
+        groups.find(group => group.targets.some(target => target.id === agent.id))!.context);
       if ((agent.configFiles ?? []).length > 0) {
         agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, agent.installedConfigFiles ?? []);
       } else {

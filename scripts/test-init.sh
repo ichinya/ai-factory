@@ -1101,3 +1101,5 @@ await assert.rejects(
 EOF
 
 echo "windows npm resolution smoke tests passed"
+
+node "$ROOT_DIR/scripts/test-codex-skill-targets.mjs" --group=control,targets,core,preflight,ownership,cli

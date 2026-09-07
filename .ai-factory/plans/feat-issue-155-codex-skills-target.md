@@ -6,7 +6,7 @@ Base commit: e144f95c89de0d0cb6c9b38dbe8c2907b00dc5ce
 Created: 2026-09-07
 Updated: 2026-09-07 — aif-improve
 Status: implementing
-Current task: 5
+Current task: 9
 Mode: full
 
 ## Original Request
@@ -204,28 +204,28 @@ init и upgrade должны учитывать эту композицию; т�
 
 ### Phase 2: Миграция и основной lifecycle
 
-- [ ] Task 5: Реализовать применение и восстановление транзакции переноса.
+- [x] Task 5: Реализовать применение и восстановление транзакции переноса.
   Deliverable: apply/resume/rollback операции C4, ограниченный journal/staging, byte backups, digest recheck, atomic config replacement и очистка только перечисленных verified entries. Добавить project migration lock и config revision check перед commit/rollback. Skills-only сохранение выполняется без native ownership hydration; сохранять старый normalized hash contract, обновляя итоговый state после полной проверенной composition установленной ревизии.
   Files: src/core/skills-migration.ts, src/core/config.ts, src/utils/fs.ts; src/core/installer.ts для строгого результата staging.
   Acceptance: ошибки copy/render/config save не теряют исходные данные; interruption до/после config commit восстанавливается; retry cleanup безопасен; concurrent edits файлов или .ai-factory.json останавливают destructive step; --force не снимает migration guard. Partial install warnings не могут считаться успешной транзакцией. Save/rollback не гидратируют native metadata и не перезаписывают чужую config revision.
   Logging: INFO начало/завершение миграции, targets и счётчики; DEBUG phases/digest checks; WARN pending cleanup/recovery; ERROR failure/rollback context и путь к recovery material. Verbose detail управляется LOG_LEVEL.
   Depends on: Task 4.
 
-- [ ] Task 6: Интегрировать extensions и injections с общими targets.
+- [x] Task 6: Интегрировать extensions и injections с общими targets.
   Deliverable: guard mutating extension add/update/remove и commitResolvedExtension после prospective runtime hydration; группировать install/remove/restore/rollback и injections по physical target. Проверять owner map, а не только transformer identity и replaces. Migration завершать до commitExtensionInstall/removePreviousExtensionState/removeExtensionFiles, затем перечитывать config; не запускать вложенную migration из уже начатого extension rollback. Проецировать replacement outcomes на всех участников, сохранив корректные successCount/agentCount. Fallback stripping использует actual skillsDir плюс необходимые flat-artifact roots.
   Files: src/cli/commands/extension.ts, src/core/extension-ops.ts, src/core/injections.ts, src/core/installer.ts, src/core/skill-targets.ts.
   Acceptance: add → update → remove и replacement rollback работают на общем каталоге; prepend/append markers единственные, counters не удвоены; отсутствующий manifest не оставляет удаляемые markers в перенесённых skills; несовместимость обнаруживается до installed asset mutations; extension list остаётся read-only.
   Logging: DEBUG physical operation и projected runtime outcomes; INFO реальные install/injection counts; WARN missing provenance; ERROR conflicting runtime IDs/target или rollback failure. Не менять MCP logging policy.
   Depends on: Tasks 3, 5.
 
-- [ ] Task 7: Защитить общие assets при снятии runtime и удалении skills.
+- [x] Task 7: Защитить общие assets при снятии runtime и удалении skills.
   Deliverable: ownership-aware removeAgentSetup и shared skill removals. Сначала вычислять surviving consumers и required skill union; сохранять используемый target, unknown/custom bytes и общие settings files. Удалять только разрешённые managed entries, а не общий skillsDir целиком.
   Files: src/cli/commands/init.ts, src/core/skill-targets.ts, src/core/installer.ts, src/core/extension-ops.ts.
   Acceptance: helper-level fixtures с явно переданным resolved survivor inventory подтверждают, что снятие CLI при App и обратный порядок сохраняют нужные навыки; .codex/config.toml остаётся, пока его использует оставшийся runtime; один участник не удаляет skill другого; native cleanup соблюдает ownership policy. End-to-end подключение этих helpers к разрешённым targets и CLI acceptance выполняются в Task 8.
   Logging: DEBUG consumers и решение retain/remove; INFO снятый runtime; WARN сохранённые пользовательские/неизвестные entries; ERROR unsafe path. Не выдавать сохранённый общий target за удалённый.
   Depends on: Tasks 2, 3, 6.
 
-- [ ] Task 8: Интегрировать target preparation и общую композицию в init/update.
+- [x] Task 8: Интегрировать target preparation и общую композицию в init/update.
   Deliverable: до первой mutation подготовить все selected/surviving/removed targets и recovery; сохранить выбор в installedAgents/config. Использовать готовые extension primitives Task 6 и ownership-aware removal Task 7. Завершать skills migration до native asset writes/extension refresh; перечитывать committed config перед обычной операцией и не возвращать старый snapshot после её отдельной ошибки. Выполнять skill operations по группам, native assets — отдельно. Для migration/shared target восстанавливать replacements/custom extension skills и injections перед hashes/save/cleanup в пределах соответствующей composition C5. Подключить готовые CLI regression cases Task 1 к штатным init/update suites.
   Files: src/cli/commands/init.ts, src/cli/commands/update.ts, src/core/installer.ts, src/core/skill-targets.ts, src/core/skills-migration.ts, scripts/test-init.sh, scripts/test-update.sh.
   Acceptance: init/re-init/update соблюдают C1–C5; repeated update не создаёт .codex/skills и не сообщает ложный drift; изменившийся source/render profile обновляется согласованно; user custom skills и native Codex bytes защищены именно при переносе; selections разных участников учитываются до removal.

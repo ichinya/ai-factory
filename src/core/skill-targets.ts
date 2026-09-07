@@ -133,7 +133,7 @@ export async function resolveSkillTargets(
   for (const target of targets) byPath.set(target.physicalPath, [...(byPath.get(target.physicalPath) ?? []), target]);
   const groups = [...byPath].map(([physicalPath, members]) => {
     const ordered = [...members].sort((a, b) => a.id.localeCompare(b.id));
-    assertCompatibleSkillTargets(ordered.map(member => ({ id: member.id, skillsDir: physicalPath })));
+    assertCompatibleSkillTargets(members.map(member => ({ id: member.id, skillsDir: physicalPath })));
     const sharedCodex = ordered.length > 1 && ordered.every(member => ['codex', 'codex-app'].includes(member.id));
     const skillsDir = ordered[0].skillsDir;
     const contexts = ordered.map(member => createSkillRenderContext(member.id, skillsDir, sharedCodex));
@@ -144,4 +144,17 @@ export async function resolveSkillTargets(
   });
   logSkillTarget('resolve:complete', { groups: groups.map(group => ({ target: group.skillsDir, members: group.targets.map(target => target.id) })) });
   return Object.freeze(groups);
+}
+
+export async function hasSurvivingConfigConsumer(
+  projectDir: string, relativePath: string, survivors: readonly SkillTargetRuntime[],
+): Promise<boolean> {
+  const target = await physicalProjectPath(projectDir, relativePath);
+  for (const survivor of survivors) {
+    const runtime = getAgentConfig(survivor.id);
+    const paths = [runtime.settingsFile, ...(runtime.configFiles ?? []).map(file => `${runtime.configDir}/${file}`)]
+      .filter((file): file is string => !!file);
+    for (const file of paths) if (await physicalProjectPath(projectDir, file) === target) return true;
+  }
+  return false;
 }
