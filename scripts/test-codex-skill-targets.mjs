@@ -812,6 +812,39 @@ test('migration', 'same physical alias is rendered without deleting its target',
   assert.ok((await fs.lstat(path.join(project, '.codex/skills'))).isSymbolicLink());
 });
 
+for (const linked of ['source', 'destination']) {
+  test('migration', `linked ${linked} skill entry keeps its unmanaged target untouched`, async project => {
+    const config = await legacyProject(project);
+    const shared = linked === 'destination';
+    if (shared) {
+      await fs.mkdir(path.join(project, '.agents/skills'), { recursive: true });
+      await fs.cp(path.join(project, '.codex/skills/aif'), path.join(project, '.agents/skills/user-owned-copy'), { recursive: true });
+    } else {
+      await fs.rename(path.join(project, '.codex/skills/aif'), path.join(project, '.codex/skills/user-owned-copy'));
+    }
+    const entry = path.join(project, shared ? '.agents/skills/aif' : '.codex/skills/aif');
+    const target = path.join(project, shared ? '.agents/skills' : '.codex/skills', 'user-owned-copy');
+    try {
+      await fs.symlink(process.platform === 'win32' ? target : 'user-owned-copy', entry, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      if (shared) await fs.rm(path.join(project, '.agents/skills'), { recursive: true });
+      else await fs.rename(target, entry);
+      if (!['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) throw error;
+      console.log(`CAPABILITY linked-entry migration unavailable (${error.code}); unmanaged-target preservation remains covered`);
+      return;
+    }
+    assert.ok((await fs.lstat(entry)).isSymbolicLink());
+    const roots = async () => ({ codex: await snapshot(path.join(project, '.codex')), agents: await snapshot(path.join(project, '.agents')) });
+    const before = await roots();
+    await assert.rejects(preflightSkillMigration(project, config), /linked entry/);
+    assert.deepEqual(await roots(), before);
+    runUpdate(project, false, false);
+    assert.deepEqual(await roots(), before);
+    assert.ok((await fs.lstat(entry)).isSymbolicLink());
+    assert.ok((await fs.readFile(path.join(target, 'SKILL.md'), 'utf8')).length > 0);
+  });
+}
+
 test('migration', 'recovery refuses a tampered path outside recorded skill roots', async project => {
   const config = await legacyProject(project);
   await assert.rejects(applySkillMigration(project, await preflightSkillMigration(project, config), {

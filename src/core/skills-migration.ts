@@ -70,6 +70,19 @@ async function matchesFile(file: string, bytes: Buffer | null, mode: number | nu
   return equalBytes(await readOptional(file), bytes) && await readMode(file) === mode;
 }
 
+// physicalProjectPath() intentionally resolves supported skill-root aliases, so a
+// linked entry must be judged at its logical path before any canonicalization.
+async function rejectLinkedSkillEntry(projectDir: string, relative: string): Promise<void> {
+  const stat = await fs.lstat(path.join(projectDir, relative)).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  if (stat?.isSymbolicLink()) {
+    logSkillTarget('[FIX:155] migration:rejected-linked-entry', { relative });
+    throw new Error(`Preserving linked entry; migration requires manual resolution: ${relative}`);
+  }
+}
+
 async function inventory(directory: string): Promise<TreeInventory | null> {
   try {
     const stat = await fs.lstat(directory);
@@ -219,6 +232,7 @@ export async function preflightSkillMigration(
       const proofs: { directory: string; physical: string; tree: TreeInventory; files: Map<string, Buffer> }[] = [];
       for (const agent of participants) {
         const directory = `${agent.skillsDir}/${name}`;
+        await rejectLinkedSkillEntry(projectDir, directory);
         const physical = await physicalProjectPath(projectDir, directory);
         if (proofs.some(proof => proof.physical === physical)) continue;
         const tree = await inventory(physical);
@@ -255,6 +269,7 @@ export async function preflightSkillMigration(
       }
       if (proofs.length === 0) throw new Error(`No installed baseline for "${name}"; restore the source before migrating to ${group.skillsDir}.`);
       const destination = `${group.skillsDir}/${name}`;
+      await rejectLinkedSkillEntry(projectDir, destination);
       const destinationPath = await physicalProjectPath(projectDir, destination);
       const destinationTree = await inventory(destinationPath);
       if (destinationTree && !equalFiles(destinationTree.files, finalFiles)
@@ -555,6 +570,7 @@ export async function applySkillMigration(
     if (plan.configBefore) await fs.writeFile(path.join(directory, 'config.before'), plan.configBefore, { flag: 'wx', mode: 0o600 });
     await fs.writeFile(path.join(directory, 'config.after'), after, { flag: 'wx', mode: 0o600 });
     for (const [index, file] of plan.files.entries()) {
+      await rejectLinkedSkillEntry(projectDir, file.path);
       const physical = await physicalProjectPath(projectDir, file.path);
       if (!await matchesFile(physical, file.before, file.beforeMode)) throw new Error(`File or permissions changed after preflight: ${file.path}`);
       journal.files.push({ path: file.path, physical, before: bytesDigest(file.before), after: bytesDigest(file.after),
@@ -655,6 +671,7 @@ export async function captureSharedSkillRollback(
       }
       const relative = transformed.flat ? `${group.context.agent.configDir}/${transformed.targetDir}/references`
         : `${group.skillsDir}/${transformed.targetDir}`;
+      await rejectLinkedSkillEntry(projectDir, relative);
       const physical = await physicalProjectPath(projectDir, relative);
       if (!snapshots.some(snapshot => snapshot.physical === physical)) snapshots.push({ relative, physical, tree: await inventory(physical) });
     }
