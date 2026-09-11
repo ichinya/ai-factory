@@ -28,10 +28,16 @@ interface TreeInventory {
 
 interface MigrationFile {
   path: string;
+  physical: string;
   before: Buffer | null;
   after: Buffer | null;
   beforeMode: number | null;
   afterMode: number | null;
+}
+
+interface ProvenRoot {
+  logical: string;
+  physical: string;
 }
 
 export interface SkillMigrationPlan {
@@ -42,6 +48,7 @@ export interface SkillMigrationPlan {
   files: MigrationFile[];
   cleanupDirectories: string[];
   warnings: string[];
+  provenRoots: ProvenRoot[];
 }
 
 async function readOptional(file: string): Promise<Buffer | null> {
@@ -80,6 +87,36 @@ async function rejectLinkedSkillEntry(projectDir: string, relative: string): Pro
   if (stat?.isSymbolicLink()) {
     logSkillTarget('[FIX:155] migration:rejected-linked-entry', { relative });
     throw new Error(`Preserving linked entry; migration requires manual resolution: ${relative}`);
+  }
+}
+
+function findProvenRoot(filePath: string, provenRoots: readonly ProvenRoot[]): ProvenRoot | undefined {
+  return [...provenRoots]
+    .filter(root => filePath === root.logical || filePath.startsWith(`${root.logical}/`))
+    .sort((a, b) => b.logical.length - a.logical.length)[0];
+}
+
+function isUnderRoot(physical: string, rootPhysical: string): boolean {
+  const prefix = `${rootPhysical}${path.sep}`;
+  return physical === rootPhysical || physical.startsWith(prefix);
+}
+
+async function rejectLinkedPathBelowRoot(projectDir: string, logicalRoot: string, filePath: string): Promise<void> {
+  const relative = path.posix.relative(logicalRoot, filePath);
+  if (relative === '' || relative.startsWith('..')) return;
+  const parts = relative.split('/');
+  parts.pop();
+  let current = logicalRoot;
+  for (const part of parts) {
+    current = `${current}/${part}`;
+    const stat = await fs.lstat(path.join(projectDir, current)).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    });
+    if (stat?.isSymbolicLink()) {
+      logSkillTarget('[FIX:155] migration:rejected-linked-ancestor', { current });
+      throw new Error(`Preserving linked entry; migration requires manual resolution: ${current}`);
+    }
   }
 }
 
@@ -197,15 +234,20 @@ export async function preflightSkillMigration(
   const files = new Map<string, MigrationFile>();
   const cleanupDirectories = new Set<string>();
   const warnings: string[] = [];
-  function addFile(relative: string, before: Buffer | null, after: Buffer | null, beforeMode: number | null, afterMode: number | null): void {
+  const provenRoots = new Map<string, string>();
+  async function addFile(relative: string, before: Buffer | null, after: Buffer | null, beforeMode: number | null, afterMode: number | null): Promise<void> {
+    const physical = await physicalProjectPath(projectDir, relative);
     const previous = files.get(relative);
     if (previous && (!equalBytes(previous.before, before) || !equalBytes(previous.after, after)
       || previous.beforeMode !== beforeMode || previous.afterMode !== afterMode)) {
       throw new Error(`Conflicting migration writes: ${relative}`);
     }
+    if (previous && previous.physical !== physical) {
+      throw new Error(`Conflicting migration physical identity: ${relative}`);
+    }
     // Unchanged destinations still prove that deleting the source is safe.
-    // Keep their bytes and modes in every precommit and recovery check.
-    files.set(relative, { path: relative, before, after, beforeMode, afterMode });
+    // Keep their bytes, modes, and physical identity in every precommit and recovery check.
+    files.set(relative, { path: relative, physical, before, after, beforeMode, afterMode });
   }
   for (const group of resolved) {
     const participants = group.targets.map(target => config.agents.find(agent => agent.id === target.id)).filter((agent): agent is AgentInstallation => !!agent);
@@ -213,6 +255,8 @@ export async function preflightSkillMigration(
       || participants.some(agent => previousGroups.find(previous => previous.targets.some(target => target.id === agent.id))?.context.hash !== group.context.hash)
       || participants.some(agent => Object.values(agent.managedSkills ?? {}).some(state => state.renderContextHash && state.renderContextHash !== group.context.hash));
     if (!needsMigration) continue;
+    for (const agent of participants) provenRoots.set(agent.skillsDir, await physicalProjectPath(projectDir, agent.skillsDir));
+    provenRoots.set(group.skillsDir, await physicalProjectPath(projectDir, group.skillsDir));
     const names = new Set(participants.flatMap(agent => agent.installedSkills.map(name => path.posix.basename(name.replaceAll('\\', '/')))));
     for (const owner of owners.values()) if (owner.extension) names.add(owner.name);
     for (const target of group.targets) {
@@ -281,14 +325,14 @@ export async function preflightSkillMigration(
           .map(tree => tree.modes.get(relative)).filter((mode): mode is number => mode !== undefined));
         if (modes.size !== 1) throw new Error(`Skill migration mode conflict: "${name}/${relative}" has differing or unknown permissions. Preserve copies and resolve their modes.`);
         const afterMode = [...modes][0];
-        addFile(`${destination}/${relative}`, destinationTree?.files.get(relative) ?? null, bytes, destinationTree?.modes.get(relative) ?? null, afterMode);
+        await addFile(`${destination}/${relative}`, destinationTree?.files.get(relative) ?? null, bytes, destinationTree?.modes.get(relative) ?? null, afterMode);
       }
       for (const [relative, bytes] of destinationTree?.files ?? []) {
-        if (!finalFiles.has(relative)) addFile(`${destination}/${relative}`, bytes, null, destinationTree!.modes.get(relative)!, null);
+        if (!finalFiles.has(relative)) await addFile(`${destination}/${relative}`, bytes, null, destinationTree!.modes.get(relative)!, null);
       }
       for (const proof of proofs) {
         if (proof.physical === destinationPath) continue;
-        for (const [relative, bytes] of proof.tree.files) addFile(`${proof.directory}/${relative}`, bytes, null, proof.tree.modes.get(relative)!, null);
+        for (const [relative, bytes] of proof.tree.files) await addFile(`${proof.directory}/${relative}`, bytes, null, proof.tree.modes.get(relative)!, null);
         // Only directories required by known files are eligible for empty-directory cleanup.
         const knownDirectories = new Set(['']);
         for (const relative of proof.files.keys()) {
@@ -318,7 +362,8 @@ export async function preflightSkillMigration(
   if (!await matchesFile(path.join(projectDir, '.ai-factory.json'), configBefore, configBeforeMode)) throw new Error('Config revision or permissions changed during migration preflight. Retry after resolving concurrent edits.');
   logSkillTarget('[FIX:155] preflight:preserved-modes', { files: files.size, configMode: configBeforeMode });
   return { config: next, configBefore, configBeforeMode, groups: resolved,
-    files: [...files.values()], cleanupDirectories: [...cleanupDirectories], warnings };
+    files: [...files.values()], cleanupDirectories: [...cleanupDirectories], warnings,
+    provenRoots: [...provenRoots].map(([logical, physical]) => ({ logical, physical })) };
 }
 
 const MIGRATION_ROOT = '.ai-factory/skill-migrations';
@@ -569,9 +614,15 @@ export async function applySkillMigration(
       files: [], cleanupDirectories: plan.cleanupDirectories };
     if (plan.configBefore) await fs.writeFile(path.join(directory, 'config.before'), plan.configBefore, { flag: 'wx', mode: 0o600 });
     await fs.writeFile(path.join(directory, 'config.after'), after, { flag: 'wx', mode: 0o600 });
+    console.log(`[FIX:155] Binding ${plan.files.length} migration file(s) to preflight provenance.`);
     for (const [index, file] of plan.files.entries()) {
       await rejectLinkedSkillEntry(projectDir, file.path);
+      const provenRoot = findProvenRoot(file.path, plan.provenRoots);
+      if (!provenRoot) throw new Error(`Untracked migration path: ${file.path}`);
+      await rejectLinkedPathBelowRoot(projectDir, provenRoot.logical, file.path);
       const physical = await physicalProjectPath(projectDir, file.path);
+      if (physical !== file.physical) throw new Error(`Skill physical identity changed after preflight: ${file.path}`);
+      if (!isUnderRoot(physical, provenRoot.physical)) throw new Error(`Skill path escaped its proven root: ${file.path}`);
       if (!await matchesFile(physical, file.before, file.beforeMode)) throw new Error(`File or permissions changed after preflight: ${file.path}`);
       journal.files.push({ path: file.path, physical, before: bytesDigest(file.before), after: bytesDigest(file.after),
         beforeMode: file.beforeMode, afterMode: file.afterMode });

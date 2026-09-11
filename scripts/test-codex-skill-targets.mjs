@@ -845,6 +845,38 @@ for (const linked of ['source', 'destination']) {
   });
 }
 
+for (const linked of ['source', 'destination']) {
+  test('migration', `linked ${linked} skill entry after preflight keeps target untouched`, async project => {
+    const config = await legacyProject(project);
+    const plan = await preflightSkillMigration(project, config);
+    const shared = linked === 'destination';
+    const entry = path.join(project, shared ? '.agents/skills/aif' : '.codex/skills/aif');
+    const target = path.join(project, shared ? '.agents/skills' : '.codex/skills', 'user-owned-copy');
+    if (shared) {
+      await fs.mkdir(path.join(project, '.agents/skills'), { recursive: true });
+      await fs.cp(path.join(project, '.codex/skills/aif'), target, { recursive: true });
+    } else {
+      await fs.rename(path.join(project, '.codex/skills/aif'), target);
+    }
+    try {
+      await fs.symlink(process.platform === 'win32' ? target : 'user-owned-copy', entry, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      if (shared) await fs.rm(path.join(project, '.agents/skills'), { recursive: true });
+      else await fs.rename(target, entry);
+      if (!['EPERM', 'EACCES', 'ENOSYS'].includes(error.code)) throw error;
+      console.log(`CAPABILITY post-preflight ${linked} link unavailable (${error.code}); linked-entry preservation remains covered`);
+      return;
+    }
+    assert.ok((await fs.lstat(entry)).isSymbolicLink());
+    const roots = async () => ({ codex: await snapshot(path.join(project, '.codex')), agents: await snapshot(path.join(project, '.agents')) });
+    const before = await roots();
+    await assert.rejects(applySkillMigration(project, plan), /linked entry|proven root|Untracked/);
+    assert.deepEqual(await roots(), before);
+    assert.ok((await fs.lstat(entry)).isSymbolicLink());
+    assert.ok((await fs.readFile(path.join(target, 'SKILL.md'), 'utf8')).length > 0);
+  });
+}
+
 test('migration', 'recovery refuses a tampered path outside recorded skill roots', async project => {
   const config = await legacyProject(project);
   await assert.rejects(applySkillMigration(project, await preflightSkillMigration(project, config), {
