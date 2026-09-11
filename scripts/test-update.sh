@@ -956,3 +956,6 @@ assert_contains "$MALFORMED_BOUNDED_UPDATE_OUTPUT" 'agent file manifest missing'
 node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const codex=c.agents.find(a=>a.id==='codex');if(!codex)process.exit(1);if(!Array.isArray(codex.installedAgentFiles)||!codex.installedAgentFiles.includes('bounded-plan-polisher.toml'))process.exit(1);if(!codex.managedAgentFiles||!codex.managedAgentFiles['bounded-plan-polisher.toml'])process.exit(1);if(!codex.agentFileSources||codex.agentFileSources['bounded-plan-polisher.toml']?.extensionName!=='aif-ext-bounded-helpers')process.exit(1);" "$BOUNDED_PROJECT_DIR/.ai-factory.json"
 
 echo "bounded helper extension update smoke tests passed"
+
+node "$ROOT_DIR/scripts/test-codex-skill-targets.mjs" --group=migration,upgrade
+node "$ROOT_DIR/scripts/test-skill-migration-modes.mjs"

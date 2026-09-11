@@ -13,19 +13,22 @@ import {
   rebuildManagedAgentFilesForAgents,
   resolveManagedConfigFilePaths,
   resolveInstalledAgentFileTargetPath,
+  removeOwnedSkills,
 } from '../../core/installer.js';
 import { saveConfig, configExists, loadConfig, getCurrentVersion, type AgentInstallation } from '../../core/config.js';
 import { configureMcp, getMcpInstructions } from '../../core/mcp.js';
 import { getAgentConfig, getAvailableAgentIds, hydrateProjectAgentRegistry } from '../../core/agents.js';
-import { assertCompatibleSkillTargets, cleanupAgentSetup, getAgentOnboarding } from '../../core/transformer.js';
-import { removeDirectory, removeFile, copyFile, fileExists, getSkillsDir } from '../../utils/fs.js';
-import { applyExtensionInjections } from '../../core/injections.js';
+import { cleanupAgentSetup, getAgentOnboarding } from '../../core/transformer.js';
+import { removeFile, copyFile, fileExists, getSkillsDir } from '../../utils/fs.js';
+import { hasSurvivingConfigConsumer, resolveSkillTargets } from '../../core/skill-targets.js';
+import { prepareSkillTargets, recoverSkillMigration, withSkillProjectLock } from '../../core/skills-migration.js';
 import {
   assertNoAgentFileConflicts,
   collectReplacedSkills,
   installExtensionAgentFilesForAllAgents,
   mergeAgentFileSources,
   mergeInstalledAgentFiles,
+  composeInstalledExtensionSkills,
 } from '../../core/extension-ops.js';
 import { loadAllExtensions, type ExtensionManifest } from '../../core/extensions.js';
 
@@ -100,9 +103,10 @@ async function removeAgentSetup(
   projectDir: string,
   agent: AgentInstallation,
   installedExtensionManifests: ExtensionManifest[] = [],
+  survivingAgents: AgentInstallation[] = [],
 ): Promise<void> {
   const agentConfig = getAgentConfig(agent.id);
-  await removeDirectory(path.join(projectDir, agent.skillsDir));
+  await removeOwnedSkills(projectDir, agent, survivingAgents);
 
   // Remove only AI Factory-managed agent files, not the entire directory.
   // The directory may contain user-created custom agents unrelated to AI Factory.
@@ -134,6 +138,7 @@ async function removeAgentSetup(
   for (const relPath of configFiles) {
     try {
       const { targetFile } = resolveManagedConfigFilePaths(projectDir, agent.id, relPath);
+      if (await hasSurvivingConfigConsumer(projectDir, path.relative(projectDir, targetFile), survivingAgents)) continue;
       await removeFile(targetFile);
     } catch (error) {
       console.log(
@@ -148,16 +153,22 @@ async function removeAgentSetup(
 }
 
 export async function initCommand(options: InitOptions = {}): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => initLocked(options));
+}
+
+async function initLocked(options: InitOptions): Promise<void> {
   const projectDir = process.cwd();
   const nonInteractive = !!options.agents;
 
   console.log(chalk.bold.blue('\n🏭 AI Factory - Project Setup\n'));
 
   const hasExistingConfig = await configExists(projectDir);
-  const existingConfig = hasExistingConfig ? await loadConfig(projectDir) : null;
+  let existingConfig = hasExistingConfig ? await loadConfig(projectDir) : null;
   await hydrateProjectAgentRegistry(projectDir, {
     extensionNames: existingConfig?.extensions?.map(extension => extension.name) ?? [],
   });
+  await recoverSkillMigration(projectDir);
+  existingConfig = await loadConfig(projectDir);
 
   if (hasExistingConfig) {
     console.log(chalk.yellow('Warning: .ai-factory.json already exists.'));
@@ -175,16 +186,23 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
       answers = await runWizard(existingAgentIds);
     }
 
-    assertCompatibleSkillTargets(
+    const groups = await resolveSkillTargets(projectDir,
       answers.agents.map(agent => ({
         id: agent.id,
-        skillsDir: getAgentConfig(agent.id).skillsDir,
+        skillsDir: existingConfig?.agents.find(previous => previous.id === agent.id)?.skillsDir ?? getAgentConfig(agent.id).skillsDir,
       })),
     );
+    if (existingConfig) await prepareSkillTargets(projectDir, existingConfig, groups);
 
     const selectedAgentIds = new Set(answers.agents.map(agent => agent.id));
     const removedAgents = (existingConfig?.agents ?? []).filter(agent => !selectedAgentIds.has(agent.id));
     const existingExtensions = existingConfig?.extensions ?? [];
+    const survivingAgents: AgentInstallation[] = answers.agents.map(selection => ({
+      ...(existingConfig?.agents.find(agent => agent.id === selection.id) ?? { mcp: { github: false, filesystem: false, postgres: false, chromeDevtools: false, playwright: false } }),
+      id: selection.id,
+      skillsDir: groups.find(group => group.targets.some(target => target.id === selection.id))!.skillsDir,
+      installedSkills: answers.selectedSkills,
+    }));
 
     if (removedAgents.length > 0) {
       console.log(chalk.dim('\nRemoving deselected agent setups...\n'));
@@ -194,7 +212,7 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
       const installedExtensionManifests = installedExtensions.map(({ manifest }) => manifest);
 
       for (const removedAgent of removedAgents) {
-        await removeAgentSetup(projectDir, removedAgent, installedExtensionManifests);
+        await removeAgentSetup(projectDir, removedAgent, installedExtensionManifests, survivingAgents);
         console.log(chalk.yellow(`  Removed: ${removedAgent.id}`));
       }
     }
@@ -203,16 +221,20 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
 
     const installedAgents: AgentInstallation[] = [];
     const mcpSummary: Record<string, string[]> = {};
+    const skillsByTarget = new Map<string, string[]>();
 
     for (const agentSelection of answers.agents) {
       const agentConfig = getAgentConfig(agentSelection.id);
+      const group = groups.find(group => group.targets.some(target => target.id === agentSelection.id))!;
 
-      const installedSkills = await installSkills({
+      const installedSkills = skillsByTarget.get(group.physicalPath) ?? await installSkills({
         projectDir,
-        skillsDir: agentConfig.skillsDir,
+        skillsDir: group.skillsDir,
         skills: answers.selectedSkills,
         agentId: agentSelection.id,
+        renderContext: group.context,
       });
+      skillsByTarget.set(group.physicalPath, installedSkills);
       const installedAgentFiles = agentConfig.agentsDir
         ? await installSubagents({
           projectDir,
@@ -245,7 +267,7 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
 
       installedAgents.push({
         id: agentSelection.id,
-        skillsDir: agentConfig.skillsDir,
+        skillsDir: group.skillsDir,
         installedSkills,
         ...(agentConfig.agentsDir ? {
           agentsDir: agentConfig.agentsDir,
@@ -285,10 +307,9 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
         mergeAgentFileSources(installedAgents, buildExtensionAgentFileSources(manifest));
       }
 
-      let totalInjections = 0;
-      for (const agent of installedAgents) {
-        totalInjections += await applyExtensionInjections(projectDir, agent, existingExtensions);
-      }
+      const totalInjections = await composeInstalledExtensionSkills(projectDir, {
+        version: getCurrentVersion(), agents: installedAgents, extensions: existingExtensions,
+      });
       if (totalInjections > 0) {
         console.log(chalk.green(`✓ Re-applied ${totalInjections} extension injection(s)`));
       }
@@ -297,7 +318,8 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
     const replacedSkills = collectReplacedSkills(existingExtensions);
     for (const agent of installedAgents) {
       const managedBaseSkills = agent.installedSkills.filter(skill => !replacedSkills.has(skill));
-      agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills);
+      agent.managedSkills = await buildManagedSkillsState(projectDir, agent, managedBaseSkills,
+        groups.find(group => group.targets.some(target => target.id === agent.id))!.context, existingExtensions);
       if ((agent.configFiles ?? []).length > 0) {
         agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, agent.installedConfigFiles ?? []);
       }

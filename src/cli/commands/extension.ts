@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import path from 'path';
 import { hydrateAgentFileSources, loadConfig, saveConfig, type AiFactoryConfig } from '../../core/config.js';
 import { hydrateProjectAgentRegistry } from '../../core/agents.js';
+import { prepareSkillTargets, withSkillProjectLock } from '../../core/skills-migration.js';
 import {
   resolveExtension,
   removeExtensionFiles,
@@ -49,6 +50,10 @@ async function loadHydratedExtensionConfig(
 }
 
 export async function extensionAddCommand(source: string): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => extensionAddLocked(source));
+}
+
+async function extensionAddLocked(source: string): Promise<void> {
   const projectDir = process.cwd();
 
   console.log(chalk.bold.blue('\n🏭 AI Factory - Install Extension\n'));
@@ -96,11 +101,16 @@ export async function extensionAddCommand(source: string): Promise<void> {
 }
 
 export async function extensionRemoveCommand(name: string): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => extensionRemoveLocked(name));
+}
+
+async function extensionRemoveLocked(name: string): Promise<void> {
   const projectDir = process.cwd();
 
   console.log(chalk.bold.blue('\n🏭 AI Factory - Remove Extension\n'));
 
   const config = await loadHydratedExtensionConfig(projectDir);
+  await prepareSkillTargets(projectDir, config);
   await hydrateAgentFileSources(projectDir, config);
 
   const extensions = config.extensions ?? [];
@@ -228,6 +238,10 @@ export async function extensionListCommand(): Promise<void> {
 }
 
 export async function extensionUpdateCommand(name?: string, options?: { force?: boolean }): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => extensionUpdateLocked(name, options));
+}
+
+async function extensionUpdateLocked(name?: string, options?: { force?: boolean }): Promise<void> {
   const projectDir = process.cwd();
   const force = options?.force ?? false;
 
@@ -238,6 +252,7 @@ export async function extensionUpdateCommand(name?: string, options?: { force?: 
   }
 
   const config = await loadHydratedExtensionConfig(projectDir, { showInitHint: true });
+  await prepareSkillTargets(projectDir, config);
 
   const extensions = config.extensions ?? [];
 

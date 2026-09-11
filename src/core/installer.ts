@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'node:fs/promises';
 import { existsSync, lstatSync } from 'fs';
 import { createHash } from 'crypto';
 import {
@@ -17,10 +18,12 @@ import {
   fileExists,
   hashDirectory,
 } from '../utils/fs.js';
-import type { AgentFileSource, AgentInstallation, ManagedArtifactState } from './config.js';
+import type { AgentFileSource, AgentInstallation, ExtensionRecord, ManagedArtifactState, ManagedSkillState } from './config.js';
 import { getAgentConfig } from './agents.js';
-import { getExtensionsDir, type ExtensionManifest, type ExtensionAgentFile } from './extensions.js';
+import { getExtensionsDir, loadAllExtensions, type ExtensionManifest, type ExtensionAgentFile } from './extensions.js';
+import { applyInjection } from './injections.js';
 import { processSkillTemplates, buildTemplateVars, processTemplate } from './template.js';
+import { createSkillRenderContext, logSkillTarget, physicalProjectPath, type SkillRenderContext } from './skill-targets.js';
 import { getTransformer, extractFrontmatterName, replaceFrontmatterName } from './transformer.js';
 
 const EXTENSION_INJECTION_BLOCK_PATTERN = /\n?<!-- aif-ext:[^:]+:[^:]+:[^:]+:start -->\n[\s\S]*?\n<!-- aif-ext:[^:]+:[^:]+:[^:]+:end -->\n?/g;
@@ -84,12 +87,14 @@ export interface UpdateConfigFilesResult {
 }
 
 export interface UpdateSkillsOptions {
+  renderContext?: SkillRenderContext;
   excludeSkills?: string[];
   force?: boolean;
   installNewSkills?: string[];
 }
 
 export interface InstallOptions {
+  renderContext?: SkillRenderContext;
   projectDir: string;
   skillsDir: string;
   skills: string[];
@@ -175,7 +180,7 @@ async function readManagedFileForHash(filePath: string): Promise<Buffer | null> 
   return readFileBuffer(filePath);
 }
 
-async function hashManagedFiles(files: Array<{ absPath: string; relPath: string }>): Promise<string | null> {
+async function hashManagedFiles(files: Array<{ absPath: string; relPath: string }>, raw = false): Promise<string | null> {
   if (files.length === 0) {
     return null;
   }
@@ -184,7 +189,7 @@ async function hashManagedFiles(files: Array<{ absPath: string; relPath: string 
   const hasher = createHash('sha256');
 
   for (const file of sortedFiles) {
-    const content = await readManagedFileForHash(file.absPath);
+    const content = await (raw ? readFileBuffer(file.absPath) : readManagedFileForHash(file.absPath));
     if (!content) {
       return null;
     }
@@ -196,7 +201,7 @@ async function hashManagedFiles(files: Array<{ absPath: string; relPath: string 
   return hasher.digest('hex');
 }
 
-async function hashManagedDirectory(dirPath: string): Promise<string | null> {
+async function hashManagedDirectory(dirPath: string, raw = false): Promise<string | null> {
   const files = await listFilesRecursive(dirPath);
   if (files.length === 0) {
     return null;
@@ -207,7 +212,7 @@ async function hashManagedDirectory(dirPath: string): Promise<string | null> {
     relPath: path.relative(dirPath, absPath).replaceAll('\\', '/'),
   }));
 
-  return hashManagedFiles(mapped);
+  return hashManagedFiles(mapped, raw);
 }
 
 async function hashManagedFile(filePath: string, relPath: string): Promise<string | null> {
@@ -376,9 +381,9 @@ export function resolveManagedSubagentPaths(
   return resolveAgentFilePaths(projectDir, agentsDir, sourceRoot, relPath);
 }
 
-async function hashInstalledSkill(paths: ResolvedSkillPaths): Promise<string | null> {
+async function hashInstalledSkill(paths: ResolvedSkillPaths, raw = false): Promise<string | null> {
   if (!paths.flat) {
-    return hashManagedDirectory(paths.targetSkillDir);
+    return hashManagedDirectory(paths.targetSkillDir, raw);
   }
 
   const mainFileExists = await fileExists(paths.targetSkillFile);
@@ -403,14 +408,15 @@ async function hashInstalledSkill(paths: ResolvedSkillPaths): Promise<string | n
     });
   }
 
-  return hashManagedFiles(filesToHash);
+  return hashManagedFiles(filesToHash, raw);
 }
 
 async function getManagedSkillState(
   projectDir: string,
   agentInstallation: AgentInstallation,
   skillName: string,
-): Promise<ManagedArtifactState | null> {
+  context = createSkillRenderContext(agentInstallation.id, agentInstallation.skillsDir),
+): Promise<ManagedSkillState | null> {
   const sourceSkillDir = path.join(getSkillsDir(), skillName);
   const sourceHash = await hashDirectory(sourceSkillDir, {
     skipDirectory: skillSourceSkipDirectory(sourceSkillDir),
@@ -421,26 +427,157 @@ async function getManagedSkillState(
 
   const paths = resolveSkillPaths(projectDir, agentInstallation.skillsDir, agentInstallation.id, skillName, sourceSkillDir);
   const installedHash = await hashInstalledSkill(paths);
-  if (!installedHash) {
+  const rawInstalledHash = await hashInstalledSkill(paths, true);
+  if (!installedHash || !rawInstalledHash) {
     return null;
   }
 
   return {
     sourceHash,
     installedHash,
+    rawInstalledHash,
+    renderContextHash: context.hash,
   };
+}
+
+interface ReceiptInjection {
+  target: string;
+  position: 'append' | 'prepend';
+  extensionName: string;
+  content: string;
+}
+
+async function readReceiptSourceFile(projectDir: string, file: string): Promise<Buffer> {
+  const relative = path.relative(path.resolve(projectDir), path.resolve(file));
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Receipt source escapes project: ${file}`);
+  }
+  let current = path.resolve(projectDir);
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new Error(`Linked receipt source: ${current}`);
+  }
+  if (!(await fs.lstat(current)).isFile()) throw new Error(`Receipt source is not a file: ${current}`);
+  return fs.readFile(current);
+}
+
+async function loadReceiptInjections(
+  projectDir: string, registeredExtensions: readonly ExtensionRecord[],
+): Promise<ReceiptInjection[]> {
+  const names = registeredExtensions.map(extension => extension.name);
+  const installed = await loadAllExtensions(projectDir, names);
+  if (new Set(names).size !== names.length || installed.length !== names.length) {
+    throw new Error('Missing or ambiguous registered extension manifest');
+  }
+  const injections: ReceiptInjection[] = [];
+  for (const { dir, manifest } of installed) {
+    await readReceiptSourceFile(projectDir, path.join(dir, 'extension.json'));
+    const record = registeredExtensions.find(extension => extension.name === manifest.name);
+    if (!record || record.version !== manifest.version) throw new Error(`Unproven extension revision: ${manifest.name}`);
+    for (const injection of manifest.injections ?? []) {
+      injections.push({ ...injection, extensionName: manifest.name,
+        content: (await readReceiptSourceFile(projectDir, path.join(dir, injection.file))).toString('utf8') });
+    }
+  }
+  return injections;
+}
+
+async function inventoryReceiptFiles(directory: string): Promise<Map<string, Buffer>> {
+  const files = new Map<string, Buffer>();
+  async function visit(current: string, relative: string): Promise<void> {
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new Error(`Linked installed skill entry: ${current}`);
+    if (stat.isDirectory()) {
+      for (const name of await fs.readdir(current)) {
+        await visit(path.join(current, name), relative ? `${relative}/${name}` : name);
+      }
+    } else if (stat.isFile() && relative) {
+      files.set(relative, await fs.readFile(current));
+    } else {
+      throw new Error(`Unsupported installed skill entry: ${current}`);
+    }
+  }
+  await visit(directory, '');
+  return files;
+}
+
+async function proveManagedSkillRawHash(
+  projectDir: string, agent: AgentInstallation, skillName: string, context: SkillRenderContext,
+  injections: readonly ReceiptInjection[],
+): Promise<string> {
+  const sourceSkillDir = path.join(getSkillsDir(), skillName);
+  if ((await fs.lstat(sourceSkillDir)).isSymbolicLink()) throw new Error(`Linked bundled skill source: ${skillName}`);
+  const expected = await renderSkillFiles(sourceSkillDir, skillName, agent.id, context);
+  let content = expected.get('SKILL.md')!.toString('utf8');
+  for (const injection of injections) {
+    if (injection.target === skillName) {
+      content = applyInjection(content, injection.content, injection.position, injection.extensionName, skillName);
+    }
+  }
+  expected.set('SKILL.md', Buffer.from(content));
+  const paths = resolveSkillPaths(projectDir, agent.skillsDir, agent.id, skillName, sourceSkillDir);
+  let actual: Map<string, Buffer>;
+  if (paths.flat) {
+    // Flat workflows share their references directory. Prove the files belonging
+    // to this source only; removal leaves all references and other workflows in place.
+    const mainName = path.basename(paths.targetSkillFile);
+    expected.set(mainName, expected.get('SKILL.md')!);
+    expected.delete('SKILL.md');
+    for (const relative of expected.keys()) {
+      if (relative !== mainName && !relative.startsWith('references/')) expected.delete(relative);
+    }
+    actual = new Map();
+    for (const relative of expected.keys()) {
+      const target = relative === mainName ? paths.targetSkillFile
+        : path.join(paths.targetRefsDir, relative.slice('references/'.length));
+      actual.set(relative, await readReceiptSourceFile(projectDir, target));
+    }
+  } else {
+    actual = await inventoryReceiptFiles(paths.targetSkillDir);
+  }
+  if (actual.size !== expected.size || [...expected].some(([relative, bytes]) => !actual.get(relative)?.equals(bytes))) {
+    throw new Error('Installed files differ from the complete known source and injection composition');
+  }
+  const hash = createHash('sha256');
+  for (const [relative, bytes] of [...actual].sort(([left], [right]) => left.localeCompare(right))) {
+    hash.update(`path:${relative}\n`);
+    hash.update(bytes);
+    hash.update('\n');
+  }
+  return hash.digest('hex');
 }
 
 export async function buildManagedSkillsState(
   projectDir: string,
   agentInstallation: AgentInstallation,
   baseSkills: string[],
-): Promise<Record<string, ManagedArtifactState>> {
-  const state: Record<string, ManagedArtifactState> = {};
+  context?: SkillRenderContext,
+  registeredExtensions: readonly ExtensionRecord[] = [],
+): Promise<Record<string, ManagedSkillState>> {
+  const state: Record<string, ManagedSkillState> = {};
+  const renderContext = context ?? createSkillRenderContext(agentInstallation.id, agentInstallation.skillsDir);
+  let injections: ReceiptInjection[] | null = null;
+  try {
+    injections = await loadReceiptInjections(projectDir, registeredExtensions);
+  } catch (error) {
+    logSkillTarget('[FIX:155] receipt:unproven-extensions', { runtime: agentInstallation.id, reason: (error as Error).message });
+  }
 
   for (const skillName of baseSkills) {
-    const managed = await getManagedSkillState(projectDir, agentInstallation, skillName);
+    const managed = await getManagedSkillState(projectDir, agentInstallation, skillName, renderContext);
     if (managed) {
+      // Observed bytes support update decisions, but do not prove ownership.
+      // Overlay installs can leave user files even after a successful write.
+      delete managed.rawInstalledHash;
+      if (injections) {
+        try {
+          managed.rawInstalledHash = await proveManagedSkillRawHash(projectDir, agentInstallation, skillName, renderContext, injections);
+          logSkillTarget('[FIX:155] receipt:proven-source', { runtime: agentInstallation.id, skill: skillName });
+        } catch (error) {
+          logSkillTarget('[FIX:155] receipt:unproven-files', { runtime: agentInstallation.id, skill: skillName, reason: (error as Error).message });
+        }
+      }
       state[skillName] = managed;
     }
   }
@@ -688,14 +825,50 @@ export async function rebuildManagedAgentFilesForAgents(
   }
 }
 
+export async function renderSkillFiles(
+  sourceSkillDir: string,
+  skillName: string,
+  agentId: string,
+  context: SkillRenderContext,
+): Promise<Map<string, Buffer>> {
+  const files = new Map<string, Buffer>();
+  const vars = buildTemplateVars(context.agent);
+  async function visit(directory: string, relative: string): Promise<void> {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      if (!relative && SKILL_INTERNAL_TOP_LEVEL_DIRS.has(entry.name)) continue;
+      const relPath = relative ? `${relative}/${entry.name}` : entry.name;
+      const source = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw new Error(`Linked skill source cannot be rendered safely: ${source}`);
+      if (entry.isDirectory()) await visit(source, relPath);
+      else if (entry.isFile()) {
+        let bytes = await fs.readFile(source);
+        if (entry.name.endsWith('.md')) {
+          let content = bytes.toString('utf8');
+          if (relPath === 'SKILL.md') {
+            content = replaceFrontmatterName(content, skillName);
+            content = getTransformer(agentId).transform(skillName, content).content;
+          }
+          bytes = Buffer.from(processTemplate(content, vars));
+        }
+        files.set(relPath, bytes);
+      } else throw new Error(`Unsupported skill source entry: ${source}`);
+    }
+  }
+  await visit(sourceSkillDir, '');
+  if (!files.has('SKILL.md')) throw new Error(`SKILL.md not found in ${sourceSkillDir}`);
+  return files;
+}
+
 async function installSkillWithTransformer(
   sourceSkillDir: string,
   skillName: string,
   projectDir: string,
   skillsDir: string,
   agentId: string,
-  agentConfig: ReturnType<typeof getAgentConfig>,
+  context: SkillRenderContext,
 ): Promise<void> {
+  const agentConfig = context.agent;
+  logSkillTarget('install:start', { agentId, skillsDir, skillName, renderContextHash: context.hash });
   const transformer = getTransformer(agentId);
   const skillMdPath = path.join(sourceSkillDir, 'SKILL.md');
   const content = await readTextFile(skillMdPath);
@@ -719,6 +892,7 @@ async function installSkillWithTransformer(
     if (await fileExists(sourceRefsDir)) {
       const targetRefsDir = path.join(projectDir, agentConfig.configDir, result.targetDir, 'references');
       await copyDirectory(sourceRefsDir, targetRefsDir);
+      await processSkillTemplates(targetRefsDir, agentConfig);
     }
   } else {
     const targetSkillDir = path.join(projectDir, skillsDir, result.targetDir);
@@ -730,14 +904,19 @@ async function installSkillWithTransformer(
     } else if (adjustedContent !== content) {
       await writeTextFile(path.join(targetSkillDir, 'SKILL.md'), adjustedContent);
     }
-    await processSkillTemplates(targetSkillDir, agentConfig);
+    const rendered = await renderSkillFiles(sourceSkillDir, skillName, agentId, context);
+    for (const [relative, bytes] of rendered) {
+      await ensureDir(path.dirname(path.join(targetSkillDir, relative)));
+      await fs.writeFile(path.join(targetSkillDir, relative), bytes);
+    }
   }
+  logSkillTarget('install:complete', { agentId, skillsDir, skillName });
 }
 
 export async function installSkills(options: InstallOptions): Promise<string[]> {
   const { projectDir, skillsDir, skills, agentId } = options;
   const installedSkills: string[] = [];
-  const agentConfig = getAgentConfig(agentId);
+  const context = options.renderContext ?? createSkillRenderContext(agentId, skillsDir);
 
   const targetDir = path.join(projectDir, skillsDir);
   await ensureDir(targetDir);
@@ -748,7 +927,7 @@ export async function installSkills(options: InstallOptions): Promise<string[]> 
     const sourceSkillDir = path.join(packageSkillsDir, skill);
 
     try {
-      await installSkillWithTransformer(sourceSkillDir, skill, projectDir, skillsDir, agentId, agentConfig);
+      await installSkillWithTransformer(sourceSkillDir, skill, projectDir, skillsDir, agentId, context);
       installedSkills.push(skill);
     } catch (error) {
       console.warn(`Warning: Could not install skill "${skill}": ${error}`);
@@ -859,15 +1038,15 @@ export async function installExtensionSkills(
   extensionDir: string,
   skillPaths: string[],
   nameOverrides?: Record<string, string>,
+  context = createSkillRenderContext(agentInstallation.id, agentInstallation.skillsDir),
 ): Promise<string[]> {
-  const agentConfig = getAgentConfig(agentInstallation.id);
   const installed: string[] = [];
 
   for (const skillPath of skillPaths) {
     const sourceDir = path.join(extensionDir, skillPath);
     const skillName = nameOverrides?.[skillPath] ?? path.basename(skillPath);
     try {
-      await installSkillWithTransformer(sourceDir, skillName, projectDir, agentInstallation.skillsDir, agentInstallation.id, agentConfig);
+      await installSkillWithTransformer(sourceDir, skillName, projectDir, agentInstallation.skillsDir, agentInstallation.id, context);
       installed.push(skillName);
     } catch (error) {
       console.warn(`Warning: Could not install extension skill "${skillName}": ${error}`);
@@ -902,6 +1081,55 @@ async function removeSkillsByName(
     }
   }
 
+  return removed;
+}
+
+export async function removeOwnedSkills(
+  projectDir: string, agent: AgentInstallation, survivors: readonly AgentInstallation[],
+): Promise<string[]> {
+  const target = await physicalProjectPath(projectDir, agent.skillsDir);
+  const consumers = await Promise.all(survivors.map(async survivor => ({
+    agent: survivor, target: await physicalProjectPath(projectDir, survivor.skillsDir),
+  })));
+  const removed: string[] = [];
+  for (const name of agent.installedSkills.filter(name => !name.includes('/'))) {
+    if (!name || name === '.' || name === '..' || name.includes('\\')) throw new Error(`Unsafe managed skill name: ${name}`);
+    const needed = consumers.some(consumer => consumer.target === target && consumer.agent.installedSkills.includes(name));
+    if (needed) {
+      logSkillTarget('remove:retain', { runtime: agent.id, skill: name, reason: 'surviving-consumer' });
+      continue;
+    }
+    const saved = agent.managedSkills?.[name];
+    const current = await getManagedSkillState(projectDir, agent, name);
+    // Update hashes normalize injections and line endings; only a saved raw
+    // receipt can authorize deletion without losing those local changes.
+    if (!saved || !current || saved.installedHash !== current.installedHash
+      || !saved.rawInstalledHash || saved.rawInstalledHash !== current.rawInstalledHash) {
+      console.warn(`[skill-targets] [FIX:155] Preserving unproven or modified skill: ${agent.skillsDir}/${name}`);
+      continue;
+    }
+    logSkillTarget('[FIX:155] remove:verified-raw-baseline', { runtime: agent.id, skill: name });
+    const transformer = getTransformer(agent.id).transform(name, '');
+    if (transformer.flat) {
+      await removeFile(path.join(projectDir, getAgentConfig(agent.id).configDir, transformer.targetDir, transformer.targetName));
+    } else {
+      const directory = path.join(target, transformer.targetDir);
+      if (lstatSync(directory).isSymbolicLink()) throw new Error(`Linked managed skill cannot be removed: ${directory}`);
+      const files = await listFilesRecursive(directory);
+      const directories = new Set([directory]);
+      for (const file of files) {
+        if (lstatSync(file).isSymbolicLink()) throw new Error(`Linked skill file cannot be removed: ${file}`);
+        let parent = path.dirname(file);
+        while (parent !== directory && parent.startsWith(`${directory}${path.sep}`)) { directories.add(parent); parent = path.dirname(parent); }
+        await removeFile(file);
+      }
+      for (const parent of [...directories].sort((a, b) => b.length - a.length)) {
+        await fs.rmdir(parent).catch(error => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
+      }
+    }
+    removed.push(name);
+    logSkillTarget('remove:complete', { runtime: agent.id, skill: name });
+  }
   return removed;
 }
 
@@ -1005,6 +1233,7 @@ export async function updateSkills(
       skillsDir: agentInstallation.skillsDir,
       skills: newSkillsToInstall,
       agentId: agentInstallation.id,
+      renderContext: options.renderContext,
     })
     : [];
   const installedNewSet = new Set(installedNewSkills);
@@ -1057,6 +1286,11 @@ export async function updateSkills(
       continue;
     }
 
+    if (previousState.renderContextHash !== (options.renderContext ?? createSkillRenderContext(agentInstallation.id, agentInstallation.skillsDir)).hash) {
+      shouldInstall.set(skillName, { install: true, reason: 'render-context-changed' });
+      continue;
+    }
+
     if (previousState.sourceHash !== sourceHash) {
       shouldInstall.set(skillName, { install: true, reason: 'source-hash-changed' });
       continue;
@@ -1083,6 +1317,7 @@ export async function updateSkills(
       skillsDir: agentInstallation.skillsDir,
       skills: skillsToInstall,
       agentId: agentInstallation.id,
+      renderContext: options.renderContext,
     })
     : [];
 

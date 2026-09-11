@@ -10,7 +10,9 @@ This page focuses on the bundled Claude and Codex files shipped by the base AI F
 
 If you have an existing AI Factory project that was initialized before bundled agent-file support was added, running `ai-factory update` will automatically install bundled package agent files into the runtime-specific target directory (`.claude/agents/` for Claude, `.codex/agents/` for Codex). `loadConfig()` still reads legacy Claude-only `subagentsDir`, `installedSubagents`, and `managedSubagents`, but persists the universal `agentsDir`, `installedAgentFiles`, `managedAgentFiles`, and `agentFileSources` fields on the next save.
 
-If you already have custom agents in `.claude/agents/` or `.codex/agents/`, they will not be touched — AI Factory only manages files listed in `installedAgentFiles`, `managedAgentFiles`, `installedConfigFiles`, and `managedConfigFiles` in `.ai-factory.json`. For Codex, that managed set includes `.codex/config.toml`; if drift is detected in that file, `ai-factory update` may overwrite it to restore the package-managed defaults.
+If you already have custom agents in `.claude/agents/` or `.codex/agents/`, they will not be touched. AI Factory tracks its managed files in `installedAgentFiles`, `managedAgentFiles`, `installedConfigFiles`, and `managedConfigFiles` in `.ai-factory.json`. Updates preserve local modifications and untracked pre-existing config files, including `.codex/config.toml`.
+
+The [Codex skill-directory migration](configuration.md#codex-skill-directories-and-migration) can move skills to `.agents/skills/`; native agents remain in `.codex/agents/` and their configuration remains in `.codex/config.toml`. Skill migration preserves native bytes and ownership records before a separate native update runs. Runtime deselection also preserves `.codex/config.toml` when Codex app still uses it.
 
 If a future AI Factory package version drops a previously bundled source file, `ai-factory update` reports that managed agent file as skipped and preserves the local tracked file instead of deleting it implicitly. Removal of managed agent files is only performed through explicit agent deselection or extension removal flows.
 
@@ -62,7 +64,7 @@ Codex receives the same narrow planning/implementation/review contract shape as 
 | `review-sidecar` | read-only correctness review | `gpt-5.4-mini` |
 | `security-sidecar` | read-only security review | `gpt-5.4-mini` |
 
-Codex also receives a managed `.codex/config.toml` with conservative `[agents]` defaults so native agent orchestration works in freshly initialized projects. That file is intentionally package-managed by AI Factory and is tracked through `installedConfigFiles` / `managedConfigFiles` in `.ai-factory.json`; `ai-factory update` may overwrite local drift in `.codex/config.toml` to restore the managed defaults.
+Codex also receives a managed `.codex/config.toml` with conservative `[agents]` defaults so native agent orchestration works in freshly initialized projects. AI Factory tracks it through `installedConfigFiles` / `managedConfigFiles` in `.ai-factory.json`. Updates can refresh a file that still matches its saved installation baseline; local changes are preserved, including during `--force` updates.
 
 When those agents are used from `aif-handoff`, the bundle is also **handoff-aware**:
 - top-level coordinators understand explicit `HANDOFF_MODE`, `HANDOFF_TASK_ID`, and `HANDOFF_SKIP_REVIEW` context passed by the parent runtime

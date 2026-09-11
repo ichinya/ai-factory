@@ -26,7 +26,7 @@ AI Factory works with any AI coding agent. During `ai-factory init`, you choose 
 | OpenCode | `.opencode/` | `.opencode/skills/` |
 | Warp | `.warp/` | `.warp/skills/` |
 | Zencoder | `.zencoder/` | `.zencoder/skills/` |
-| Codex CLI | `.codex/` | `.codex/skills/` |
+| Codex CLI | `.codex/` | `.agents/skills/` when `.agents/` already exists; otherwise `.codex/skills/` |
 | Codex app | `.agents/` | `.agents/skills/` |
 | GitHub Copilot | `.github/` | `.github/skills/` |
 | Gemini CLI | `.gemini/` | `.gemini/skills/` |
@@ -36,7 +36,7 @@ AI Factory works with any AI coding agent. During `ai-factory init`, you choose 
 
 When Claude Code is selected, AI Factory installs bundled Claude agent files into `.claude/agents/` and tracks them in `.ai-factory.json` with the universal `agentsDir`, `installedAgentFiles`, and `managedAgentFiles` fields. When Codex CLI is selected, AI Factory also installs bundled Codex native agent TOML files into `.codex/agents/` plus a managed `.codex/config.toml`. That Codex bundle is currently the baseline planning / implementation / review layer, not full parity with the broader Claude bundle, and `.codex/config.toml` is intentionally AI-Factory-managed. Extensions can additionally provide agent files for Codex or extension-defined runtimes through the same generic agent-files mechanism, but the bundled Claude/Codex package inventory is documented separately in [Subagents](subagents.md).
 
-Codex CLI and Codex app receive Codex-style skill content and use `$aif-*` invocations. Slash-command runtimes keep `/aif-*` examples. Because Codex app and Universal both write to `.agents/skills/` with different invocation styles, select one of those runtimes per project.
+Codex CLI and Codex app receive Codex-style skill content and use `$aif-*` invocations. They can share `.agents/skills/`. Slash-command runtimes keep `/aif-*` examples; Universal cannot share a physical skill directory with either Codex runtime because their rendered content differs. See [Codex skill directories and migration](configuration.md#codex-skill-directories-and-migration) for first-init defaults, saved overrides, and conflict recovery.
 
 MCP server configuration is supported for Claude Code, Cursor, GitHub Copilot, Roo Code, Kilo Code, OpenCode, Qwen Code, Codex app, and Universal / Other. Universal writes standard MCP settings to `.mcp.json`. Other agents get skills installed with correct paths but without MCP auto-configuration.
 
@@ -123,7 +123,8 @@ Run `ai-factory upgrade` to migrate old bare-named skills (`commit`, `feature`, 
 - Checks for extension updates from their sources (npm, GitHub, etc.) before updating base skills
 - Prints per-agent status buckets for base skills (`changed`, `unchanged`, `skipped`, `removed`)
 - For runtimes with managed agent files, refreshes bundled package-managed agent files and prints a separate `Agent files` status block
-- For Codex CLI, also refreshes managed `.codex/config.toml` and prints a separate `Config files` status block; drift in that file may be overwritten to restore AI-Factory-managed defaults
+- For Codex CLI, prepares any required skill-directory migration before extension or native-file updates; unresolved migration conflicts stop the update, including with `--force`
+- For Codex CLI, also refreshes managed `.codex/config.toml` and prints a separate `Config files` status block; local modifications and untracked pre-existing config files are preserved
 - Skills newly available in the package but not previously installed are shown as `skipped` (not auto-installed)
 
 ### Documentation Commands

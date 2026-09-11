@@ -91,7 +91,15 @@
 }
 ```
 
-The `agents` array can include any built-in agent IDs plus runtime IDs provided by installed extensions. Each agent keeps its own `skillsDir`, installed skills list, and MCP preferences. Runtimes that support custom agent files also persist `agentsDir` and `installedAgentFiles`, so `ai-factory update` can refresh package-managed agent files alongside skills. Codex additionally persists `configFiles` / `installedConfigFiles` for managed files such as `.codex/config.toml`; tracked managed config files may be repaired by `ai-factory update` when their managed hashes drift, while untracked pre-existing files are preserved during migration. Codex app is currently skills-first: it installs Codex-style skills into `.agents/skills` and can write MCP config to `.codex/config.toml`, but it does not define a runtime-global `agentsDir`. AI Factory additionally stores internal `managedSkills`, `managedAgentFiles`, `managedConfigFiles`, and `agentFileSources` maps in `.ai-factory.json`; they are omitted from the example above for brevity. `managedAgentFiles` keeps source/install hashes, while `agentFileSources` records whether each tracked agent file comes from the bundled package inventory or from an extension manifest. `loadConfig()` still reads legacy Claude-only `subagentsDir`, `installedSubagents`, and `managedSubagents` keys for backward compatibility, but new saves use the universal field names and backfill `agentFileSources` when the source can be recovered from bundled inventory or installed extension manifests.
+The `agents` array can include any built-in agent IDs plus runtime IDs provided by installed extensions. Each agent keeps its own `skillsDir`, installed skills list, and MCP preferences. Runtimes that support custom agent files also persist `agentsDir` and `installedAgentFiles`, so `ai-factory update` can refresh package-managed agent files alongside skills.
+
+Codex additionally persists `configFiles` / `installedConfigFiles` for managed files such as `.codex/config.toml`. Updates refresh files that still match the saved installation baseline; local modifications and untracked pre-existing config files are preserved. Codex app installs Codex-style skills into `.agents/skills` and can write MCP config to `.codex/config.toml`, but it does not define a runtime-global `agentsDir`.
+
+AI Factory also stores internal `managedSkills`, `managedAgentFiles`, `managedConfigFiles`, and `agentFileSources` maps, omitted above for brevity. Managed entries keep source/install hashes. Skill entries may additionally carry `renderContextHash`, which detects changed template paths or shared-runtime profiles even when package source bytes are unchanged, and `rawInstalledHash`, which includes injection content and exact file bytes. These fields do not change native agent/config ownership.
+
+Removing a runtime deletes its unneeded skills only when they match the saved raw baseline as well as the normalized install hash. Modified skills and legacy entries without a raw baseline are preserved with a warning. Init, update, and upgrade issue a raw baseline only when the complete installed skill matches the rendered package source and verified registered injections. Unknown files, links, injection markers, or unavailable injection sources prevent a new deletion baseline, including after a skill was reinstalled.
+
+`agentFileSources` records bundled or extension ownership. `loadConfig()` still reads legacy Claude-only `subagentsDir`, `installedSubagents`, and `managedSubagents` keys; new saves use the universal names and backfill sources when bundled inventory or installed extension manifests provide evidence.
 
 Extension-provided agent files can target non-Claude runtimes such as Codex. Those files are often bounded helper workers (for example, one-shot reviewers or plan polishers), not automatic equivalents of the bundled Claude coordinator agents. Documentation and prompts should describe those support boundaries explicitly instead of implying full parity across runtimes. AI Factory copies those runtime-specific agent files verbatim; runtime-local keys such as `model`, `model_reasoning_effort`, `sandbox_mode`, and `developer_instructions` belong in the agent file itself rather than in `.ai-factory.json` or workflow prompts. For bounded Codex helpers, prefer read-only advisory workers unless the runtime-native agent truly owns writes to a specific artifact.
 
@@ -109,6 +117,41 @@ Extension refresh uses the saved `source` field:
 - local paths and non-GitHub git sources require `--force` for refresh
 
 When GitHub-backed extension refreshes are frequent, set `GITHUB_TOKEN` to raise the GitHub API rate limit used by these checks.
+
+## Codex Skill Directories and Migration
+
+For Codex CLI, AI Factory selects the skill directory from the project state before the command creates any directories. Codex app keeps its `.agents/skills` default.
+
+| Saved Codex CLI target | Project state at command start | Effective target |
+|---|---|---|
+| Unset or `.codex/skills` | `.agents/` exists as a directory, including an empty one | `.agents/skills` |
+| Unset or `.codex/skills` | `.agents/` is absent or is an ordinary file | `.codex/skills` |
+| `.agents/skills` | Directory exists or needs recreation | `.agents/skills` |
+| Another project-relative path | With or without `.agents/` | Saved path |
+
+The presence of `.codex/` does not override an existing `.agents/` directory. An empty project initialized with both CLI and app retains their separate defaults for that first command, regardless of selection order. A later update sees the app's `.agents/` directory and prepares the CLI migration. Re-init preserves saved shared or custom targets.
+
+### Shared Content and Native Files
+
+CLI and app can use one physical skill directory. AI Factory installs their combined required skill set once, while retaining each runtime's selections and results. Shared content uses `$aif-*`, the effective skill path, `.codex` configuration paths, and a common Codex rendering profile. A singleton keeps its own runtime metadata; sharing does not change either runtime's MCP capabilities.
+
+Custom project paths affect project-local helper references. Home-scope references keep the runtime's normal home skill directory; a project override is not treated as a home override. CLI and app sharing a custom target use the common Codex home profile (`~/.codex/skills`); a singleton app keeps `~/.agents/skills`. Incompatible renderers, including Codex and Universal, cannot share a physical directory. Nested targets, paths outside the project, unsafe links, and overlaps with native files or migration state are rejected before installed-file changes.
+
+Only skills move. `.codex/agents/`, `.codex/config.toml`, custom native files, and their ownership records stay in place during migration. Later native updates run separately. Removing one runtime preserves skills required by the survivor and preserves `.codex/config.toml` while another runtime still uses it. Moving skills does not guarantee that Codex context-budget warnings disappear.
+
+### Conflicts and Recovery
+
+`init`, `update`, `upgrade`, and mutating extension commands prepare targets before ordinary installation or removal. Preflight compares actual files, including injections, with known bundled or installed extension sources and saved ownership evidence. Compatible copies can be consolidated. Unknown files, local edits, changed injection content, missing baselines, or unresolved extension sources stop the migration; `--force` does not bypass this check.
+
+If a conflict names two directories, keep both copies and compare the reported skill files with their bundled or installed extension source. Back up local work before resolving it. Restore the proven source revision or reconcile the changes manually, then rerun the command. AI Factory does not merge local edits or invent missing ownership hashes. Unknown entries outside managed skill directories, including empty directories, are retained. Do not delete the whole `.codex` directory.
+
+Migration writes and verifies destination files, atomically saves the new skill target, then removes only proven source files. A project lock prevents concurrent AI Factory mutations. The journal and raw recovery copies live under `.ai-factory/skill-migrations/`; completed operations retain their copies for inspection.
+
+On POSIX systems, migration and rollback preserve file permission bits, including executable scripts and private config files. Conflicting permissions or concurrent permission changes stop migration. Recovery journals and backup files use `0600`; operation directories use `0700`. Ownership, ACLs, and extended attributes are outside this permission guarantee. Legacy journals without permission history cannot recreate prior files safely on POSIX: recovery retains the material and reports the missing metadata instead of guessing permissions.
+
+After an interruption, rerun the command. Recovery rolls back destination writes if the old config is still current, or finishes cleanup if the new config was committed. If files or `.ai-factory.json` changed concurrently, recovery stops and retains its material. Preserve that directory, reconcile the reported file/config revision with the saved copies, and retry. A later extension or native-update error does not roll back an already committed skill migration.
+
+Set `LOG_LEVEL=debug` for target decisions, rendering profiles, and migration diagnostics. Normal output reports conflicts and recovery locations without requiring debug logging. See [Extensions](extensions.md#shared-skill-targets) for replacement and injection behavior.
 
 ## `.ai-factory/config.yaml` — User Preferences
 

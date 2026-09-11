@@ -14,6 +14,9 @@ import {
 } from '../../core/installer.js';
 import { getAgentConfig, hydrateProjectAgentRegistry } from '../../core/agents.js';
 import { fileExists, removeDirectory, removeFile } from '../../utils/fs.js';
+import { resolveSkillTargets } from '../../core/skill-targets.js';
+import { prepareSkillTargets, recoverSkillMigration, withSkillProjectLock } from '../../core/skills-migration.js';
+import { collectReplacedSkills, composeInstalledExtensionSkills } from '../../core/extension-ops.js';
 
 // Old v1 skill directory names that were renamed to aif-* in v2
 const OLD_SKILL_NAMES = [
@@ -111,11 +114,15 @@ async function removeLegacySkillArtifacts(options: LegacySkillRemovalOptions): P
 }
 
 export async function upgradeCommand(): Promise<void> {
+  return withSkillProjectLock(process.cwd(), () => upgradeLocked());
+}
+
+async function upgradeLocked(): Promise<void> {
   const projectDir = process.cwd();
 
   console.log(chalk.bold.blue('\n🏭 AI Factory - Upgrade to v2\n'));
 
-  const config = await loadConfig(projectDir);
+  let config = await loadConfig(projectDir);
 
   if (!config) {
     console.log(chalk.red('Error: No .ai-factory.json found.'));
@@ -132,6 +139,17 @@ export async function upgradeCommand(): Promise<void> {
   await hydrateProjectAgentRegistry(projectDir, {
     extensionNames: config.extensions?.map(extension => extension.name) ?? [],
   });
+  await recoverSkillMigration(projectDir);
+  config = (await loadConfig(projectDir))!;
+  const oldSkillRoots = new Map(config.agents.map(agent => [agent.id, agent.skillsDir]));
+  const groups = await resolveSkillTargets(projectDir, config.agents);
+  const availableSkills = await getAvailableSkills();
+  // v1 names are handled by the explicit upgrade cleanup below. Only installed v2
+  // skills with verifiable receipts participate in the skills-only transaction.
+  const migrationConfig = structuredClone(config);
+  for (const agent of migrationConfig.agents) agent.installedSkills = agent.installedSkills.filter(skill => availableSkills.includes(skill));
+  await prepareSkillTargets(projectDir, migrationConfig, groups);
+  config = (await loadConfig(projectDir))!;
 
   // Step 1: Migrate legacy plan directories to .ai-factory/plans/
   // Also ensure newer v2 working directories exist.
@@ -168,17 +186,19 @@ export async function upgradeCommand(): Promise<void> {
     }
   }
 
-  const availableSkills = await getAvailableSkills();
+  const installedByTarget = new Map<string, string[]>();
+  const cleanedRoots = new Set<string>();
 
   for (const agent of config.agents) {
     const agentConfig = getAgentConfig(agent.id);
-    const skillsDir = path.join(projectDir, agent.skillsDir);
+    const skillsDir = path.join(projectDir, oldSkillRoots.get(agent.id) ?? agent.skillsDir);
+    const group = groups.find(group => group.targets.some(target => target.id === agent.id))!;
     const isAntigravity = agent.id === 'antigravity';
     let removedCount = 0;
 
     console.log(chalk.dim(`Scanning for old-format skills [${agent.id}]...\n`));
 
-    for (const oldName of OLD_SKILL_NAMES) {
+    for (const oldName of cleanedRoots.has(skillsDir) ? [] : OLD_SKILL_NAMES) {
       removedCount += await removeLegacySkillArtifacts({
         projectDir,
         configDir: agentConfig.configDir,
@@ -196,7 +216,7 @@ export async function upgradeCommand(): Promise<void> {
       ...OLD_AIF_PREFIX_SKILL_NAMES,
     ]));
 
-    for (const oldSkill of obsoleteSkills) {
+    for (const oldSkill of cleanedRoots.has(skillsDir) ? [] : obsoleteSkills) {
       removedCount += await removeLegacySkillArtifacts({
         projectDir,
         configDir: agentConfig.configDir,
@@ -206,6 +226,7 @@ export async function upgradeCommand(): Promise<void> {
         removeWorkflow: isAntigravity,
       });
     }
+    cleanedRoots.add(skillsDir);
 
     if (removedCount === 0) {
       console.log(chalk.dim(`  [${agent.id}] No old-format skills found.\n`));
@@ -216,12 +237,14 @@ export async function upgradeCommand(): Promise<void> {
     console.log(chalk.dim(`Installing new-format skills [${agent.id}]...\n`));
 
     const { custom: customSkills } = partitionSkills(agent.installedSkills);
-    const installedSkills = await installSkills({
+    const installedSkills = installedByTarget.get(group.physicalPath) ?? await installSkills({
       projectDir,
       skillsDir: agent.skillsDir,
       skills: availableSkills,
       agentId: agent.id,
+      renderContext: group.context,
     });
+    installedByTarget.set(group.physicalPath, installedSkills);
     const installedAgentFiles = agent.agentsDir
       ? await installSubagents({
         projectDir,
@@ -250,7 +273,14 @@ export async function upgradeCommand(): Promise<void> {
       agent.installedConfigFiles = installedConfigFiles;
       agent.managedConfigFiles = await buildManagedConfigFilesState(projectDir, agent, installedConfigFiles);
     }
-    agent.managedSkills = await buildManagedSkillsState(projectDir, agent, installedSkills);
+  }
+
+  await composeInstalledExtensionSkills(projectDir, config);
+  const replaced = collectReplacedSkills(config.extensions ?? []);
+  for (const agent of config.agents) {
+    agent.managedSkills = await buildManagedSkillsState(projectDir, agent,
+      agent.installedSkills.filter(skill => availableSkills.includes(skill) && !replaced.has(skill)),
+      groups.find(group => group.targets.some(target => target.id === agent.id))!.context, config.extensions ?? []);
   }
 
   // Step 3: Update config to latest version and multi-agent schema
