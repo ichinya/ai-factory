@@ -773,7 +773,10 @@ Distills books, documents, folders, or URLs into one reusable Agent Skill or a s
 - `--path <directory>` overrides the output root, so packages are saved under `<directory>/<skill-name>/` or `<directory>/<prefix>-<child-scope>/` in split mode
 - Produces a compact `SKILL.md` plus detailed `references/` and practical `examples/`
 - Converts source material into workflows, heuristics, checklists, pitfalls, and examples rather than a long summary
+- Preserves source kind, permitted locator, revision, known terms references, relevant notices, and export restrictions in the existing source map; distinguishes known, unknown, not-applicable, and redacted metadata without claiming redistribution permission
+- Separates quoted/referenced material, interpretation, and independently authored guidance; source or terms changes supersede the prior metadata revision
 - `--redact-source-map` skips `SOURCE-MAP.md` and source-map sections entirely, so exact source titles, URLs, local paths, repository paths, filenames, and link reference definitions are not written to generated files
+- Redacted packages carry a neutral `Source use` section with safe metadata, restrictions, and explicit reduced public traceability; downstream handoffs preserve the same disclosure limits
 - `--split` creates several focused child skills directly under the resolved output root; `--split-by auto|goal|topic|workflow|audience` controls boundary selection
 - Split children always share one namespace prefix to avoid collisions: `--name` when supplied, otherwise a prefix derived from the book or primary material title
 - Split child suffixes should describe user goals and actions, not source themes; examples include `refactoring-review`, `test-design`, `argument-edit`, `decision-brief`, `incident-triage`, and `practice-drill`
@@ -783,6 +786,7 @@ Distills books, documents, folders, or URLs into one reusable Agent Skill or a s
 - Uses temporary extraction artifacts for large material and removes them after generation
 - Reads `.ai-factory/config.yaml` for `language.ui`, `language.artifacts`, and `language.technical_terms`
 - Best when you want a durable single skill from focused material or a toolkit of narrow skills from broad material
+- Local distillation needs no registry or legal-approval gate. Publishing is a separate explicit opt-in; unresolved reuse decisions stay with the source/package owner
 
 - Config policy: config-aware for language only; generated skill package content uses `language.artifacts`, while prompts and summaries use `language.ui`
 

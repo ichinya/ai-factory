@@ -1,0 +1,50 @@
+# Behavioral fixture; npm test does not execute model workflows.
+scenario: redacted-source-terms
+description: Redaction also covers terms references and notices in split children.
+skill: aif-distillation
+argument: "./hidden-atlas.md --name operations --path ./output --split-by goal --redact-source-map"
+max_turns: 40
+fixtures:
+  git_init: false
+  files_unstaged:
+    - path: hidden-atlas.md
+      content: |
+        # Hidden Atlas
+        Source kind: internal guide, edition 2.
+        Terms reference: https://hidden.example.test/terms.
+        Notice: Attribute Hidden Atlas by Secret Author.
+        User export restriction: local use only.
+        Two independent jobs: incident triage and incident retrospective.
+        Triage: establish impact, choose reversible mitigation, verify recovery.
+        Retrospective: build a timeline, identify contributing factors,
+        assign an owner and verification date to each corrective action.
+assertions:
+  - id: no-source-map
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+  - id: no-identifiers-in-written-files
+    type: no_tool_called
+    tool: Write
+    args_match:
+      content: '(?i)(Hidden Atlas|hidden-atlas|hidden\.example\.test|Secret Author)'
+  - id: no-identifiers-in-edits
+    type: no_tool_called
+    tool: Edit
+    args_match:
+      new_string: '(?i)(Hidden Atlas|hidden-atlas|hidden\.example\.test|Secret Author)'
+  - id: reduced-traceability-explicit
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: 'output/operations-[^/]+/SKILL\.md$'
+      content: '(?i)reduced public traceability'
+  - id: restrictions-retained
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: 'output/operations-[^/]+/SKILL\.md$'
+      content: '(?i)local (use )?only'
+  - id: stay-in-sandbox
+    type: no_path_escape
