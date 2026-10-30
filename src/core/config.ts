@@ -110,7 +110,7 @@ function normalizeMcp(mcp?: Partial<McpConfig>): McpConfig {
 function createAgentInstallation(agentId: string, legacy?: LegacyAiFactoryConfig): AgentInstallation {
   const agent = getAgentConfig(agentId);
   return {
-    skillsDir: legacy?.skillsDir ?? agent.skillsDir,
+    skillsDir: legacy?.skillsDir ?? (agentId === 'windsurf' ? '.windsurf/skills' : agent.skillsDir),
     id: agentId,
     installedSkills: legacy?.installedSkills ?? [],
     managedSkills: {},
@@ -255,7 +255,7 @@ export async function loadConfig(projectDir: string): Promise<AiFactoryConfig | 
     const normalizedAgents = raw.agents.map(agent => {
       const legacyAgent = agent as unknown as LegacyAgentInstallationShape;
       const agentConfig = findAgentConfig(agent.id);
-      const skillsDir = legacyAgent.skillsDir || agentConfig?.skillsDir;
+      const skillsDir = legacyAgent.skillsDir || (agent.id === 'windsurf' ? '.windsurf/skills' : agentConfig?.skillsDir);
 
       if (!skillsDir) {
         throw new Error(

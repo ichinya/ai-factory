@@ -13,6 +13,7 @@ export interface AgentConfig {
   displayName: string;
   configDir: string;
   skillsDir: string;
+  homeSkillsDir?: string;
   agentsDir?: string;
   agentFileExtension?: AgentFileExtension;
   settingsFile: string | null;
@@ -133,12 +134,13 @@ const BUILTIN_AGENT_REGISTRY: Record<string, AgentConfig> = {
   },
   windsurf: {
     id: 'windsurf',
-    displayName: 'Windsurf',
-    configDir: '.windsurf',
-    skillsDir: '.windsurf/skills',
+    displayName: 'Devin Desktop (formerly Windsurf)',
+    configDir: '.devin',
+    skillsDir: '.devin/skills',
+    homeSkillsDir: '.config/devin/skills',
     settingsFile: null,
     supportsMcp: false,
-    skillsCliAgent: 'windsurf',
+    skillsCliAgent: 'devin',
     source: 'builtin',
   },
   warp: {

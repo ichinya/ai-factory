@@ -321,17 +321,18 @@ rm -rf "$TEST_TMPDIR"
 # report it. Fixture is placed at the canonical install location
 # (.claude/skills/<name>/SKILL.md) so all safety checks pass and
 # safe_remove_installed proceeds.
+for skills_root in .claude/skills .devin/skills .windsurf/skills; do
 fresh_tmp
 write_lock "$TEST_TMPDIR" '{
   "version": 1,
   "skills": {"foo": {"source": "x/y"}}
 }'
-mkdir -p "$TEST_TMPDIR/.claude/skills/foo"
-printf '%s\n' '---' 'name: foo' '---' '# leftover' > "$TEST_TMPDIR/.claude/skills/foo/SKILL.md"
+mkdir -p "$TEST_TMPDIR/$skills_root/foo"
+printf '%s\n' '---' 'name: foo' '---' '# leftover' > "$TEST_TMPDIR/$skills_root/foo/SKILL.md"
 if "$PYTHON" "$HELPER" --skill foo --root "$TEST_TMPDIR" \
-   --installed-path .claude/skills/foo > "$TEST_TMPDIR/out" 2>&1; then
-    if [[ ! -e "$TEST_TMPDIR/.claude/skills/foo" ]]; then
-        pass "--installed-path leftover under skills/ → exit 0 + dir gone"
+   --installed-path "$skills_root/foo" > "$TEST_TMPDIR/out" 2>&1; then
+    if [[ ! -e "$TEST_TMPDIR/$skills_root/foo" ]]; then
+        pass "--installed-path leftover under $skills_root → exit 0 + dir gone"
     else
         fail "--installed-path leftover under skills/" \
              "helper exited 0 but directory remains: $(cat "$TEST_TMPDIR/out")"
@@ -341,6 +342,7 @@ else
          "helper exited non-zero: $(cat "$TEST_TMPDIR/out")"
 fi
 rm -rf "$TEST_TMPDIR"
+done
 
 # ─────────────────────────────────────────────
 # Test 10: cli_failed downgraded when --installed-path confirms removal
@@ -953,6 +955,7 @@ if helper_dirs is None:
     sys.exit(1)
 
 agent_dirs = set(re.findall(r"skillsDir:\s*'([^']+)'", agents_path.read_text(encoding='utf-8')))
+agent_dirs.add('.windsurf/skills')  # Supported pre-rebrand installations.
 if helper_dirs != agent_dirs:
     print(f'missing in helper: {sorted(agent_dirs - helper_dirs)}')
     print(f'extra in helper: {sorted(helper_dirs - agent_dirs)}')

@@ -9,7 +9,7 @@ export interface TemplateVars {
   skills_cli_agent_flag: string;
 }
 
-export function buildTemplateVars(agent: AgentConfig & { homeSkillsDir?: string }): TemplateVars {
+export function buildTemplateVars(agent: AgentConfig): TemplateVars {
   return {
     config_dir: agent.configDir,
     skills_dir: agent.skillsDir,
