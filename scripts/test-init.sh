@@ -133,7 +133,7 @@ echo "claude init smoke tests passed"
 if ! AIF_TEST_ROOT_DIR="$ROOT_DIR" AIF_TEST_PROJECT_DIR="$TMPDIR/init-devin" node --input-type=module > "$TMPDIR/init-devin.log" 2>&1 <<'EOF'
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -146,8 +146,9 @@ const { getAgentConfig, getAgentChoices } = await import(pathToFileURL(path.join
 assert.ok(getAgentChoices().some(choice => choice.value === 'windsurf' && choice.name.includes('Devin Desktop')));
 assert.equal(buildTemplateVars(getAgentConfig('windsurf')).home_skills_dir, '~/.config/devin/skills');
 
-for (const legacy of [false, true]) {
-  const project = `${process.env.AIF_TEST_PROJECT_DIR}-${legacy ? 'legacy' : 'new'}`;
+for (const mode of ['new', 'legacy', 'legacy-single', 'legacy-array']) {
+  const legacy = mode !== 'new';
+  const project = `${process.env.AIF_TEST_PROJECT_DIR}-${mode}`;
   await mkdir(project);
   process.chdir(project);
   const skillsDir = legacy ? '.windsurf/skills' : '.devin/skills';
@@ -159,17 +160,25 @@ for (const legacy of [false, true]) {
   });
   await initCommand({ agents: 'windsurf', skills: 'aif' });
   Object.assign(agent, current);
-  await updateCommand();
   const expectedFlag = legacy ? '--agent windsurf' : '--agent devin';
-  assert.ok((await readFile(`${skillsDir}/aif/SKILL.md`, 'utf8')).includes(expectedFlag));
-  await initCommand({ agents: 'windsurf', skills: 'aif' });
-  const config = JSON.parse(await readFile('.ai-factory.json', 'utf8'));
-  assert.equal(config.agents[0].id, 'windsurf');
-  assert.equal(config.agents[0].skillsDir, skillsDir);
-  const skill = await readFile(`${skillsDir}/aif/SKILL.md`, 'utf8');
-  assert.ok(existsSync(`${skillsDir}/aif-skill-generator/scripts/security-scan.py`));
-  assert.ok(skill.includes(expectedFlag));
-  assert.equal(existsSync(legacy ? '.devin' : '.windsurf'), false);
+  for (const operation of ['update', 'init']) {
+    if (mode === 'legacy-single' || mode === 'legacy-array') {
+      const saved = JSON.parse(await readFile('.ai-factory.json', 'utf8'));
+      delete saved.agents[0].skillsDir;
+      await writeFile('.ai-factory.json', JSON.stringify(mode === 'legacy-single'
+        ? { version: saved.version, agent: 'windsurf', installedSkills: saved.agents[0].installedSkills, mcp: saved.agents[0].mcp }
+        : saved));
+    }
+    if (operation === 'update') await updateCommand();
+    else await initCommand({ agents: 'windsurf', skills: 'aif' });
+    const config = JSON.parse(await readFile('.ai-factory.json', 'utf8'));
+    assert.equal(config.agents[0].id, 'windsurf');
+    assert.equal(config.agents[0].skillsDir, skillsDir, `${mode}: ${operation} must preserve the legacy target`);
+    const skill = await readFile(`${skillsDir}/aif/SKILL.md`, 'utf8');
+    assert.ok(existsSync(`${skillsDir}/aif-skill-generator/scripts/security-scan.py`));
+    assert.ok(skill.includes(expectedFlag));
+    assert.equal(existsSync(legacy ? '.devin' : '.windsurf'), false);
+  }
 }
 EOF
 then
