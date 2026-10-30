@@ -23,6 +23,11 @@ Separate what the source says from what the agent infers about this project:
   neutral approved identifier and mark public provenance `redacted`; do not
   invent a public locator or claim that traceability is complete. If the
   originating restrictions are unclear, clarify before persisting identifiers.
+- When a distilled package supplies source-use metadata, carry its current
+  metadata revision, known terms, relevant notices, export restrictions, and
+  unresolved conflicts/owner decisions with the source claim. Preserve
+  `unknown`, `not-applicable`, and `redacted` states and reduced public
+  traceability; independent authorship does not establish reuse permission.
 
 `/aif-distillation` continues to own only its selected skill outputs and
 `/aif-reference` its configured references. They can suggest `/aif-explore`;
