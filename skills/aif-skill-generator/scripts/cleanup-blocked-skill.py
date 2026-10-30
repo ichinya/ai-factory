@@ -61,6 +61,8 @@ _BUILTIN_AGENT_SKILLS_DIRS = (
     '.gemini/skills',
     '.junie/skills',
     '.qwen/skills',
+    '.devin/skills',
+    # Saved pre-rebrand installations still use this supported legacy root.
     '.windsurf/skills',
     '.warp/skills',
     '.zencoder/skills',

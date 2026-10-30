@@ -130,6 +130,54 @@ EXPECTED_AGENT_FILES="$EXPECTED_AGENT_FILES" node -e "const fs=require('fs');con
 
 echo "claude init smoke tests passed"
 
+if ! AIF_TEST_ROOT_DIR="$ROOT_DIR" AIF_TEST_PROJECT_DIR="$TMPDIR/init-devin" node --input-type=module > "$TMPDIR/init-devin.log" 2>&1 <<'EOF'
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const root = process.env.AIF_TEST_ROOT_DIR;
+const { initCommand } = await import(pathToFileURL(path.join(root, 'dist/cli/commands/init.js')));
+const { updateCommand } = await import(pathToFileURL(path.join(root, 'dist/cli/commands/update.js')));
+const { buildTemplateVars } = await import(pathToFileURL(path.join(root, 'dist/core/template.js')));
+const { getAgentConfig, getAgentChoices } = await import(pathToFileURL(path.join(root, 'dist/core/agents.js')));
+
+assert.ok(getAgentChoices().some(choice => choice.value === 'windsurf' && choice.name.includes('Devin Desktop')));
+assert.equal(buildTemplateVars(getAgentConfig('windsurf')).home_skills_dir, '~/.config/devin/skills');
+
+for (const legacy of [false, true]) {
+  const project = `${process.env.AIF_TEST_PROJECT_DIR}-${legacy ? 'legacy' : 'new'}`;
+  await mkdir(project);
+  process.chdir(project);
+  const skillsDir = legacy ? '.windsurf/skills' : '.devin/skills';
+  const agent = getAgentConfig('windsurf');
+  const current = { ...agent };
+  if (legacy) Object.assign(agent, {
+    displayName: 'Windsurf', configDir: '.windsurf', skillsDir,
+    homeSkillsDir: undefined, skillsCliAgent: 'windsurf',
+  });
+  await initCommand({ agents: 'windsurf', skills: 'aif' });
+  Object.assign(agent, current);
+  await updateCommand();
+  const expectedFlag = legacy ? '--agent windsurf' : '--agent devin';
+  assert.ok((await readFile(`${skillsDir}/aif/SKILL.md`, 'utf8')).includes(expectedFlag));
+  await initCommand({ agents: 'windsurf', skills: 'aif' });
+  const config = JSON.parse(await readFile('.ai-factory.json', 'utf8'));
+  assert.equal(config.agents[0].id, 'windsurf');
+  assert.equal(config.agents[0].skillsDir, skillsDir);
+  const skill = await readFile(`${skillsDir}/aif/SKILL.md`, 'utf8');
+  assert.ok(existsSync(`${skillsDir}/aif-skill-generator/scripts/security-scan.py`));
+  assert.ok(skill.includes(expectedFlag));
+  assert.equal(existsSync(legacy ? '.devin' : '.windsurf'), false);
+}
+EOF
+then
+  cat "$TMPDIR/init-devin.log"
+  exit 1
+fi
+echo "Devin Desktop init/update smoke tests passed (new and legacy directories)"
+
 AIF_TEST_ROOT_DIR="$ROOT_DIR" AIF_TEST_PROJECT_DIR="$TMPDIR/init-smoke-skill-selection" node --input-type=module > "$TMPDIR/init-skill-selection.log" 2>&1 <<'EOF'
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';

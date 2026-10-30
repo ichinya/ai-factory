@@ -6,7 +6,7 @@ import { assertCompatibleSkillTargets, getTransformerIdentity, type SkillTargetR
 import { buildTemplateVars } from './template.js';
 
 export interface SkillRenderContext {
-  readonly agent: Readonly<AgentConfig & { homeSkillsDir?: string }>;
+  readonly agent: Readonly<AgentConfig>;
   readonly transformerAgentId?: string;
   readonly hash: string;
 }
@@ -85,6 +85,9 @@ export function createSkillRenderContext(agentId: string, skillsDir: string, sha
   const agent = Object.freeze({
     ...registry,
     skillsDir: normalizeRelative(skillsDir),
+    // Keep saved Windsurf render profiles stable so updates need no migration.
+    ...(agentId === 'windsurf' && normalizeRelative(skillsDir) !== '.devin/skills'
+      ? { configDir: '.windsurf', displayName: 'Windsurf', homeSkillsDir: '.windsurf/skills', skillsCliAgent: 'windsurf' } : {}),
     ...(sharedCodex ? { configDir: '.codex', settingsFile: '.codex/config.toml', displayName: 'Codex', skillsCliAgent: 'codex',
       homeSkillsDir: getAgentConfig('codex').skillsDir } : {}),
   });

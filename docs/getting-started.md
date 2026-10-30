@@ -23,7 +23,7 @@ AI Factory works with any AI coding agent. During `ai-factory init`, you choose 
 |-------|-----------------|-----------------|
 | Claude Code | `.claude/` | `.claude/skills/` |
 | Cursor | `.cursor/` | `.cursor/skills/` |
-| Windsurf | `.windsurf/` | `.windsurf/skills/` |
+| Devin Desktop (formerly Windsurf) | `.devin/` | `.devin/skills/` |
 | Roo Code | `.roo/` | `.roo/skills/` |
 | Kilo Code | `.kilocode/` | `.kilocode/skills/`, `.kilocode/workflows/` |
 | Antigravity | `.agents/` | `.agents/skills/` |
@@ -37,6 +37,17 @@ AI Factory works with any AI coding agent. During `ai-factory init`, you choose 
 | Junie | `.junie/` | `.junie/skills/` |
 | Qwen Code | `.qwen/` | `.qwen/skills/` |
 | Universal / Other | `.agents/` | `.agents/skills/` |
+
+Devin Desktop [replaced Windsurf](https://cognition.com/blog/introducing-devin-desktop)
+on June 2, 2026. AI Factory keeps the `windsurf` agent ID for CLI/config
+compatibility (`ai-factory init --agents windsurf`). New installations use
+`.devin/skills/`, global references use `~/.config/devin/skills/` (shared with
+Devin CLI), and external `npx skills` commands use `--agent devin`.
+
+Existing installations retain their saved skills directory and Windsurf template
+settings during `init` and `update`, including `--agent windsurf` for external
+skills. Devin Desktop [still reads `.windsurf/skills/`](https://docs.devin.ai/desktop/cascade/skills),
+so no file migration is required.
 
 When Claude Code is selected, AI Factory installs bundled Claude agent files into `.claude/agents/` and tracks them in `.ai-factory.json` with the universal `agentsDir`, `installedAgentFiles`, and `managedAgentFiles` fields. When Codex CLI is selected, AI Factory also installs bundled Codex native agent TOML files into `.codex/agents/` plus a managed `.codex/config.toml`. When Antigravity is selected, AI Factory installs bundled Antigravity agent files into `.agents/agents/`, triggered rules into `.agents/rules/`, and configures MCP in `.agents/mcp_config.json`. Extensions can additionally provide agent files for Codex or extension-defined runtimes through the same generic agent-files mechanism, but the bundled Claude/Codex/Antigravity package inventory is documented separately in [Subagents](subagents.md).
 

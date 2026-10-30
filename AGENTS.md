@@ -9,7 +9,7 @@
 1. **CLI tool** (`ai-factory init/update/upgrade`) — installs skills and configures MCP
 2. **Built-in skills** (33 skills, all `aif-*` prefixed) — workflow commands for spec-driven development
 3. **Spec-driven workflow** — structured approach: plan → implement → commit
-4. **Multi-agent support** — 16 agents (Claude Code, Cursor, Windsurf, Roo Code, Kilo Code, Antigravity, OpenCode, Warp,
+4. **Multi-agent support** — 16 agents (Claude Code, Cursor, Devin Desktop (formerly Windsurf), Roo Code, Kilo Code, Antigravity, OpenCode, Warp,
    Zencoder, Codex CLI, Codex app, GitHub Copilot, Gemini CLI, Junie, Qwen Code, Universal)
 
 ## Project Structure
@@ -100,6 +100,7 @@ Default artifacts are `.ai-factory/instruction-runs/<run-id>/manifest.json` and 
 - Selecting `aif` also selects `aif-skill-generator`, which supplies setup's security scanner and blocked-skill cleanup helpers. `init` records this managed dependency; `update` heals older selections missing it. Other skill selections remain independent.
 - **User skills**: `<agent-config-dir>/skills/` (e.g. `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`)
 - **Agent transformer system**: `src/core/transformers/` adapts skill format per agent (e.g. Codex rewrites invocation prefixes to `$`, Antigravity 2.0 uses `.agents/` with triggered rules and subagents, KiloCode sanitizes dotted names)
+- Devin Desktop keeps the `windsurf` runtime ID. New installs use `.devin/skills/`; saved legacy/custom directories keep the Windsurf render profile in `createSkillRenderContext` so receipt checks do not require migration. Blocked-skill cleanup accepts both `.devin/skills` and `.windsurf/skills`.
 
 ### Extension tool permissions
 
