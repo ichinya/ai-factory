@@ -709,6 +709,12 @@ else
     pass "aif-distillation helper tests skipped ${YELLOW}(Python 3 not found)${NC}"
 fi
 
+if node "$ROOT_DIR/scripts/test-distillation-source-use.mjs"; then
+    pass "source-use assertions reject update, split-child, and handoff regressions (no inference)"
+else
+    fail "source-use assertion sensitivity checks"
+fi
+
 # Portable question instructions must survive every built-in rendering profile.
 if ROOT_DIR="$ROOT_DIR" node --input-type=module - <<'EOF'
 import assert from 'node:assert/strict';

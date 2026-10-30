@@ -36,5 +36,41 @@ assertions:
     args_match:
       file_path: 'SOURCE-MAP\.md$'
       new_string: '(?i)(revision[^\n]*2[\s\S]*supersede|supersede[\s\S]*revision[^\n]*2)'
+  - id: new-revision-is-current
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: '(?i)revision[^\n]*\b2\b[^\n]*current'
+  - id: updated-terms-reference
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: 'https://example\.test/triage/TERMS'
+  - id: updated-local-use-restriction
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: '(?i)local (use )?only'
+  - id: updated-no-public-export
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: '(?i)no public export'
+  - id: old-revision-is-historical
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: '(?i)(revision[^\n]*\b1\b[^\n]*(superseded|historical)|(superseded|historical)[^\n]*revision[^\n]*\b1\b)'
+  - id: old-terms-are-historical
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: 'SOURCE-MAP\.md$'
+      new_string: '(?i)((historical|superseded)(?:(?!metadata revision[^\n]*\b2\b[^\n]*current)[\s\S])*CC-BY-4\.0|CC-BY-4\.0[^\n]*(historical|superseded))'
   - id: stay-in-sandbox
     type: no_path_escape

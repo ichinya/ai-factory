@@ -2,7 +2,9 @@
 scenario: redacted-source-terms
 description: Redaction also covers terms references and notices in split children.
 skill: aif-distillation
-argument: "./hidden-atlas.md --name operations --path ./output --split-by goal --redact-source-map"
+argument: >-
+  ./hidden-atlas.md --name operations --path ./output --split-by goal --redact-source-map
+  Create exactly two children named operations-incident-triage and operations-incident-retrospective.
 max_turns: 40
 fixtures:
   git_init: false
@@ -34,17 +36,22 @@ assertions:
     tool: Edit
     args_match:
       new_string: '(?i)(Hidden Atlas|hidden-atlas|hidden\.example\.test|Secret Author)'
-  - id: reduced-traceability-explicit
+  - id: triage-current-redacted-metadata
     type: tool_called
     tool: Write
     args_match:
-      file_path: 'output/operations-[^/]+/SKILL\.md$'
-      content: '(?i)reduced public traceability'
-  - id: restrictions-retained
+      file_path: 'output/operations-incident-triage/SKILL\.md$'
+      content: &current-redacted-metadata '(?i)^(?=[\s\S]*metadata revision[^\n]*\b1\b[^\n]*current)(?=[\s\S]*terms[^\n]*redacted)(?=[\s\S]*local (?:use )?only)(?=[\s\S]*reduced public traceability)[\s\S]*$'
+  - id: retrospective-current-redacted-metadata
     type: tool_called
     tool: Write
     args_match:
-      file_path: 'output/operations-[^/]+/SKILL\.md$'
-      content: '(?i)local (use )?only'
+      file_path: 'output/operations-incident-retrospective/SKILL\.md$'
+      content: *current-redacted-metadata
+  - id: no-unexpected-child
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: 'output/operations-(?!(?:incident-triage|incident-retrospective)/)[^/]+/SKILL\.md$'
   - id: stay-in-sandbox
     type: no_path_escape
